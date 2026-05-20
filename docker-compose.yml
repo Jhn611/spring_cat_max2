@@ -1,0 +1,39 @@
+services:
+  data-service:
+    image: springcat-app:latest
+    build:
+      context: .
+    command: ["node", "dist/data-service/index.js"]
+    environment:
+      DATA_SERVICE_PORT: "3060"
+      DATABASE_PATH: /app/data/springcat.sqlite
+    ports:
+      - "3060:3060"
+    volumes:
+      - springcat-data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:3060/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  bot:
+    image: springcat-app:latest
+    command: ["node", "dist/bot/index.js"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATA_SERVICE_URL: http://data-service:3060
+    depends_on:
+      data-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  springcat-data:

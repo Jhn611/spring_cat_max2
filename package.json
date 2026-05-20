@@ -1,0 +1,29 @@
+{
+  "name": "spring-cat40-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/bot/index.ts",
+    "dev:bot": "tsx watch src/bot/index.ts",
+    "dev:service": "tsx watch src/data-service/index.ts",
+    "start:service": "node dist/data-service/index.js",
+    "start": "node dist/bot/index.js",
+    "start:bot": "node dist/bot/index.js",
+    "build": "tsc --noEmit false",
+    "docker:up": "docker compose up --build",
+    "docker:down": "docker compose down"
+  },
+  "dependencies": {
+    "@maxhub/max-bot-api": "^0.2.0",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=18.18"
+  }
+}
