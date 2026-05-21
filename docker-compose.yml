@@ -1,4 +1,21 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: springcat
+      POSTGRES_USER: springcat
+      POSTGRES_PASSWORD: springcat
+    ports:
+      - "5432:5432"
+    volumes:
+      - springcat-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U springcat -d springcat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   data-service:
     image: springcat-app:latest
     build:
@@ -6,11 +23,12 @@ services:
     command: ["node", "dist/data-service/index.js"]
     environment:
       DATA_SERVICE_PORT: "3060"
-      DATABASE_PATH: /app/data/springcat.sqlite
+      DATABASE_URL: postgres://springcat:springcat@postgres:5432/springcat
     ports:
       - "3060:3060"
-    volumes:
-      - springcat-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -36,4 +54,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  springcat-data:
+  springcat-postgres:

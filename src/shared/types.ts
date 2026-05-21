@@ -1,4 +1,4 @@
-export type Role = 'applicant' | 'organizer' | 'admin';
+export type Role = 'applicant' | 'organizer' | 'admin' | 'tech_admin';
 
 export type EventFormat = 'online' | 'offline';
 

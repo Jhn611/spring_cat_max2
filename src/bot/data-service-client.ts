@@ -24,11 +24,16 @@ export class DataServiceClient {
     return this.requestOrUndefined(`/users/${userId}`);
   }
 
+  listUsers(role?: Role): Promise<StoredUser[]> {
+    const query = role ? `?role=${encodeURIComponent(role)}` : '';
+    return this.request(`/users${query}`);
+  }
+
   upsertUser(user: Omit<StoredUser, 'updatedAt'>): Promise<StoredUser> {
     return this.request('/users/upsert', { method: 'POST', body: user });
   }
 
-  setUserRole(userId: number, role: Role): Promise<void> {
+  setUserRole(userId: number, role: Role): Promise<StoredUser> {
     return this.request(`/users/${userId}/role`, { method: 'PATCH', body: { role } });
   }
 

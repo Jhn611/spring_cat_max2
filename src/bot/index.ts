@@ -14,12 +14,8 @@ if (!token) {
 const bot = new Bot(token);
 const store = new DataServiceClient(process.env.DATA_SERVICE_URL ?? 'http://localhost:3060');
 const legalDocVersion = process.env.LEGAL_DOC_VERSION ?? 'hackathon-2026-05-14';
-const adminIds = new Set(
-  (process.env.ADMIN_MAX_IDS ?? '')
-    .split(',')
-    .map((id) => Number(id.trim()))
-    .filter(Number.isFinite)
-);
+const adminIds = parseIdSet(process.env.ADMIN_MAX_IDS);
+const techAdminIds = parseIdSet(process.env.TECH_ADMIN_MAX_IDS ?? process.env.MAIN_ADMIN_MAX_IDS);
 
 type AnyContext = Context<any>;
 
@@ -29,6 +25,13 @@ const statusLabels: Record<RegistrationStatus, string> = {
   cancelled_by_user: 'Отменена пользователем',
   cancelled_by_organizer: 'Отменена организатором',
   late_cancelled: 'Поздняя отмена'
+};
+
+const roleLabels: Record<Role, string> = {
+  applicant: 'Абитуриент',
+  organizer: 'Организатор',
+  admin: 'Админ',
+  tech_admin: 'Техадмин'
 };
 
 const notificationTemplates = {
@@ -45,6 +48,15 @@ function rows(buttons: ReturnType<typeof Keyboard.button.callback>[][]) {
 
 function button(text: string, payload: string, intent: 'default' | 'positive' | 'negative' = 'default') {
   return Keyboard.button.callback(text, payload, { intent });
+}
+
+function parseIdSet(raw?: string): Set<number> {
+  return new Set(
+    (raw ?? '')
+      .split(',')
+      .map((id) => Number(id.trim()))
+      .filter(Number.isFinite)
+  );
 }
 
 function formatDate(iso: string): string {
@@ -93,6 +105,10 @@ function getSender(ctx: AnyContext) {
 }
 
 function roleFor(userId: number, saved?: StoredUser): Role {
+  if (techAdminIds.has(userId)) {
+    return 'tech_admin';
+  }
+
   if (adminIds.has(userId)) {
     return 'admin';
   }
@@ -159,6 +175,11 @@ async function showMainMenu(ctx: AnyContext, user?: StoredUser) {
 
   if (current.role === 'organizer' || current.role === 'admin') {
     menu.push([button('Меню организатора', 'org')]);
+  }
+
+  if (current.role === 'tech_admin') {
+    menu.push([button('Меню организатора', 'org')]);
+    menu.push([button('Админ-панель', 'admin')]);
   }
 
   await ctx.reply('Выберите действие:', rows(menu));
@@ -409,13 +430,13 @@ async function toggleNotifications(ctx: AnyContext, registrationId: string, enab
 }
 
 function canManage(user: StoredUser, event: EventCard): boolean {
-  return user.role === 'admin' || event.organizerIds.includes(user.id);
+  return user.role === 'admin' || user.role === 'tech_admin' || event.organizerIds.includes(user.id);
 }
 
 async function showOrganizerMenu(ctx: AnyContext) {
   const user = await requireConsent(ctx);
 
-  if (!user || (user.role !== 'admin' && user.role !== 'organizer')) {
+  if (!user || (user.role !== 'admin' && user.role !== 'tech_admin' && user.role !== 'organizer')) {
     await ctx.reply('Меню организатора доступно только организатору или администратору.');
     return;
   }
@@ -568,6 +589,118 @@ async function sendEventNotification(ctx: AnyContext, eventId: string, kind: key
   await ctx.reply(`Уведомление отправлено. Получателей: ${recipients.length}.`);
 }
 
+async function requireTechAdmin(ctx: AnyContext): Promise<StoredUser | undefined> {
+  const user = await requireConsent(ctx);
+
+  if (!user) {
+    return undefined;
+  }
+
+  if (user.role !== 'tech_admin') {
+    await ctx.reply('Это действие доступно только техническому админу.');
+    return undefined;
+  }
+
+  return user;
+}
+
+async function showAdminPanel(ctx: AnyContext) {
+  const user = await requireTechAdmin(ctx);
+
+  if (!user) {
+    return;
+  }
+
+  await ctx.reply(
+    [
+      'Админ-панель',
+      '',
+      'Добавить админа: /admin_add MAX_ID',
+      'Добавить организатора: /admin_org MAX_ID',
+      'Снять права: /admin_remove MAX_ID',
+      'Открыть карточку: /admin_user MAX_ID',
+      '',
+      'MAX ID пользователь может узнать командой /whoami.'
+    ].join('\n'),
+    rows([
+      [button('Список админов', 'admin:list:admin')],
+      [button('Список организаторов', 'admin:list:organizer')],
+      [button('Список техадминов', 'admin:list:tech_admin')]
+    ])
+  );
+}
+
+async function showUsersByRole(ctx: AnyContext, role: Role) {
+  const user = await requireTechAdmin(ctx);
+
+  if (!user) {
+    return;
+  }
+
+  const users = await store.listUsers(role);
+
+  if (users.length === 0) {
+    await ctx.reply(`Пользователей с ролью "${roleLabels[role]}" пока нет.`);
+    return;
+  }
+
+  const lines = users.slice(0, 30).map((item) => formatUserLine(item));
+  await ctx.reply([`Роль: ${roleLabels[role]}`, ...lines].join('\n'));
+}
+
+async function showAdminUserCard(ctx: AnyContext, userIdRaw: string) {
+  const user = await requireTechAdmin(ctx);
+  const targetId = parseUserId(userIdRaw);
+
+  if (!user || !targetId) {
+    await ctx.reply('Укажите MAX ID числом. Например: /admin_user 123456789');
+    return;
+  }
+
+  const target = await store.getUser(targetId);
+  await ctx.reply(
+    [
+      target ? formatUserLine(target) : `MAX ID ${targetId}`,
+      '',
+      target ? 'Выберите действие:' : 'Пользователь еще не писал боту, но роль можно назначить заранее.'
+    ].join('\n'),
+    rows([
+      [button('Сделать админом', `admin:role:${targetId}:admin`, 'positive')],
+      [button('Сделать организатором', `admin:role:${targetId}:organizer`, 'positive')],
+      [button('Сделать обычным', `admin:role:${targetId}:applicant`, 'negative')]
+    ])
+  );
+}
+
+async function setRoleFromAdmin(ctx: AnyContext, userIdRaw: string, role: Role) {
+  const user = await requireTechAdmin(ctx);
+  const targetId = parseUserId(userIdRaw);
+
+  if (!user || !targetId) {
+    await ctx.reply('Укажите MAX ID числом.');
+    return;
+  }
+
+  if (targetId === user.id && role !== 'tech_admin') {
+    await ctx.reply('Нельзя снять технические права у самого себя через бота.');
+    return;
+  }
+
+  const updated = await store.setUserRole(targetId, role);
+  await ctx.reply(`Готово: ${formatUserLine(updated)}`);
+}
+
+function parseUserId(raw: string): number | undefined {
+  const normalized = raw.trim().replace(/[^\d]/g, '');
+  const id = Number(normalized);
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
+function formatUserLine(user: StoredUser): string {
+  const username = user.username ? ` @${user.username}` : '';
+  return `${user.id} - ${user.name}${username} - ${roleLabels[user.role]}`;
+}
+
 function makeCode(): string {
   return `SC40-${randomBytes(3).toString('hex').toUpperCase()}`;
 }
@@ -585,6 +718,9 @@ await bot.api.setMyCommands([
   { name: 'events', description: 'Каталог мероприятий' },
   { name: 'my', description: 'Мои записи' },
   { name: 'org', description: 'Меню организатора' },
+  { name: 'admin', description: 'Админ-панель' },
+  { name: 'admin_add', description: 'Назначить админа по MAX ID' },
+  { name: 'admin_remove', description: 'Снять права по MAX ID' },
   { name: 'find', description: 'Найти запись по коду' },
   { name: 'whoami', description: 'Показать ваш MAX ID' }
 ]);
@@ -598,9 +734,26 @@ bot.command('start', async (ctx) => showMainMenu(ctx));
 bot.command('events', async (ctx) => showCatalog(ctx));
 bot.command('my', async (ctx) => showMyRegistrations(ctx));
 bot.command('org', async (ctx) => showOrganizerMenu(ctx));
+bot.command('admin', async (ctx) => showAdminPanel(ctx));
 bot.command('whoami', async (ctx) => {
   const user = await rememberUser(ctx);
   await ctx.reply(user ? `Ваш MAX ID: ${user.id}` : 'Не удалось определить MAX ID.');
+});
+
+bot.hears(/^\/admin_add\s+(.+)/i, async (ctx) => {
+  await setRoleFromAdmin(ctx, ctx.match?.[1] ?? '', 'admin');
+});
+
+bot.hears(/^\/admin_org\s+(.+)/i, async (ctx) => {
+  await setRoleFromAdmin(ctx, ctx.match?.[1] ?? '', 'organizer');
+});
+
+bot.hears(/^\/admin_remove\s+(.+)/i, async (ctx) => {
+  await setRoleFromAdmin(ctx, ctx.match?.[1] ?? '', 'applicant');
+});
+
+bot.hears(/^\/admin_user\s+(.+)/i, async (ctx) => {
+  await showAdminUserCard(ctx, ctx.match?.[1] ?? '');
 });
 
 bot.hears(/^\/find\s+(.+)/i, async (ctx) => {
@@ -643,6 +796,7 @@ bot.action(/.*/, async (ctx) => {
   if (payload === 'catalog') return showCatalog(ctx);
   if (payload === 'my') return showMyRegistrations(ctx);
   if (payload === 'org') return showOrganizerMenu(ctx);
+  if (payload === 'admin') return showAdminPanel(ctx);
   if (scope === 'event') return showEventDetails(ctx, a);
   if (scope === 'enroll') return startEnrollment(ctx, a);
   if (scope === 'slot') return showEnrollmentSummary(ctx, a, b);
@@ -656,6 +810,8 @@ bot.action(/.*/, async (ctx) => {
   if (scope === 'org' && a === 'notify') return showNotifyMenu(ctx, b);
   if (scope === 'org' && a === 'status') return setOrganizerStatus(ctx, b, c as RegistrationStatus);
   if (scope === 'org' && a === 'send') return sendEventNotification(ctx, b, c as keyof typeof notificationTemplates);
+  if (scope === 'admin' && a === 'list') return showUsersByRole(ctx, b as Role);
+  if (scope === 'admin' && a === 'role') return setRoleFromAdmin(ctx, b, c as Role);
 
   await ctx.reply('Неизвестное действие. Откройте /start.');
 });
