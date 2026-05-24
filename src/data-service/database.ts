@@ -1,7 +1,8 @@
 import pg from 'pg';
 import { events as seedEvents } from './seed-events.js';
+import { universities as seedUniversities } from './seed-universities.js';
 import { isActiveStatus } from '../shared/domain.js';
-import type { EventCard, Registration, Role, StoredUser } from '../shared/types.js';
+import type { EventCard, Registration, Role, StoredUser, University } from '../shared/types.js';
 
 const { Pool } = pg;
 
@@ -10,7 +11,8 @@ type DbUserRow = {
   name: string;
   username: string | null;
   role: Role;
-  consent_json: string | null;
+  university_id: string | null;
+  consent_json: string | object | null;
   updated_at: Date | string;
 };
 
@@ -32,6 +34,14 @@ type DbEventRow = {
   data_json: EventCard | string;
 };
 
+type DbUniversityRow = {
+  id: string;
+  title: string;
+  short_title: string;
+  city: string;
+  description: string;
+};
+
 export class DatabaseStore {
   private readonly pool: pg.Pool;
 
@@ -41,6 +51,7 @@ export class DatabaseStore {
 
   async init(): Promise<void> {
     await this.migrate();
+    await this.seedUniversities();
     await this.seedEvents();
   }
 
@@ -48,9 +59,22 @@ export class DatabaseStore {
     await this.pool.end();
   }
 
-  async listEvents(): Promise<EventCard[]> {
+  async listUniversities(): Promise<University[]> {
+    const { rows } = await this.pool.query<DbUniversityRow>('SELECT * FROM universities ORDER BY title');
+    return rows.map((row) => this.mapUniversity(row));
+  }
+
+  async getUniversity(universityId: string): Promise<University | undefined> {
+    const { rows } = await this.pool.query<DbUniversityRow>('SELECT * FROM universities WHERE id = $1', [universityId]);
+    return rows[0] ? this.mapUniversity(rows[0]) : undefined;
+  }
+
+  async listEvents(universityId?: string): Promise<EventCard[]> {
+    const params = universityId ? [universityId] : [];
+    const where = universityId ? 'WHERE university_id = $1' : '';
     const { rows } = await this.pool.query<{ data_json: EventCard | string }>(
-      'SELECT data_json FROM events ORDER BY starts_at'
+      `SELECT data_json FROM events ${where} ORDER BY starts_at`,
+      params
     );
     return rows.map((row) => this.parseEvent(row.data_json));
   }
@@ -61,15 +85,37 @@ export class DatabaseStore {
   }
 
   async listManageableEvents(userId: number, role: Role): Promise<EventCard[]> {
+    const user = await this.getUser(userId);
     const events = await this.listEvents();
-    return role === 'admin' || role === 'tech_admin' ? events : events.filter((event) => event.organizerIds.includes(userId));
+
+    if (role === 'tech_admin') {
+      return events;
+    }
+
+    if (role === 'admin') {
+      return user?.universityId ? events.filter((event) => event.universityId === user.universityId) : [];
+    }
+
+    return events.filter((event) => event.universityId === user?.universityId || event.organizerIds.includes(userId));
   }
 
-  async listUsers(role?: Role): Promise<StoredUser[]> {
-    const result = role
-      ? await this.pool.query<DbUserRow>('SELECT * FROM users WHERE role = $1 ORDER BY updated_at DESC', [role])
-      : await this.pool.query<DbUserRow>('SELECT * FROM users ORDER BY updated_at DESC');
-    return result.rows.map((row) => this.mapUser(row));
+  async listUsers(role?: Role, universityId?: string): Promise<StoredUser[]> {
+    const clauses: string[] = [];
+    const params: string[] = [];
+
+    if (role) {
+      params.push(role);
+      clauses.push(`role = $${params.length}`);
+    }
+
+    if (universityId) {
+      params.push(universityId);
+      clauses.push(`university_id = $${params.length}`);
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const { rows } = await this.pool.query<DbUserRow>(`SELECT * FROM users ${where} ORDER BY updated_at DESC`, params);
+    return rows.map((row) => this.mapUser(row));
   }
 
   async freeSeats(eventId: string): Promise<number> {
@@ -86,14 +132,15 @@ export class DatabaseStore {
 
   async upsertUser(user: Omit<StoredUser, 'updatedAt'>): Promise<StoredUser> {
     const existing = await this.getUser(user.id);
-    const next: StoredUser = { ...existing, ...user, updatedAt: new Date().toISOString() };
+    const next: StoredUser = { ...existing, ...user, universityId: existing?.universityId ?? user.universityId, updatedAt: new Date().toISOString() };
 
     await this.pool.query(
       [
-        'INSERT INTO users (id, name, username, role, consent_json, updated_at)',
-        'VALUES ($1, $2, $3, $4, $5, $6)',
+        'INSERT INTO users (id, name, username, role, university_id, consent_json, updated_at)',
+        'VALUES ($1, $2, $3, $4, $5, $6, $7)',
         'ON CONFLICT(id) DO UPDATE SET',
         'name = EXCLUDED.name, username = EXCLUDED.username, role = EXCLUDED.role,',
+        "university_id = CASE WHEN EXCLUDED.role IN ('tech_admin', 'applicant') THEN NULL ELSE COALESCE(users.university_id, EXCLUDED.university_id) END,",
         'consent_json = EXCLUDED.consent_json, updated_at = EXCLUDED.updated_at'
       ].join(' '),
       [
@@ -101,6 +148,7 @@ export class DatabaseStore {
         next.name,
         next.username ?? null,
         next.role,
+        next.universityId ?? null,
         next.consent ? JSON.stringify(next.consent) : null,
         next.updatedAt
       ]
@@ -114,7 +162,7 @@ export class DatabaseStore {
     return rows[0] ? this.mapUser(rows[0]) : undefined;
   }
 
-  async setUserRole(userId: number, role: Role): Promise<StoredUser> {
+  async setUserRole(userId: number, role: Role, universityId?: string | null): Promise<StoredUser> {
     const existing = await this.getUser(userId);
     const now = new Date().toISOString();
     const next: StoredUser = {
@@ -122,17 +170,27 @@ export class DatabaseStore {
       name: existing?.name ?? `MAX ID ${userId}`,
       username: existing?.username,
       role,
+      universityId: role === 'tech_admin' || role === 'applicant' ? undefined : universityId ?? existing?.universityId,
       consent: existing?.consent,
       updatedAt: now
     };
 
     await this.pool.query(
       [
-        'INSERT INTO users (id, name, username, role, consent_json, updated_at)',
-        'VALUES ($1, $2, $3, $4, $5, $6)',
-        'ON CONFLICT(id) DO UPDATE SET role = EXCLUDED.role, updated_at = EXCLUDED.updated_at'
+        'INSERT INTO users (id, name, username, role, university_id, consent_json, updated_at)',
+        'VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        'ON CONFLICT(id) DO UPDATE SET',
+        'role = EXCLUDED.role, university_id = EXCLUDED.university_id, updated_at = EXCLUDED.updated_at'
       ].join(' '),
-      [next.id, next.name, next.username ?? null, next.role, next.consent ? JSON.stringify(next.consent) : null, now]
+      [
+        next.id,
+        next.name,
+        next.username ?? null,
+        next.role,
+        next.universityId ?? null,
+        next.consent ? JSON.stringify(next.consent) : null,
+        now
+      ]
     );
 
     return next;
@@ -227,17 +285,27 @@ export class DatabaseStore {
 
   private async migrate(): Promise<void> {
     await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS universities (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        short_title TEXT NOT NULL,
+        city TEXT NOT NULL,
+        description TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS users (
         id BIGINT PRIMARY KEY,
         name TEXT NOT NULL,
         username TEXT,
         role TEXT NOT NULL,
+        university_id TEXT REFERENCES universities(id),
         consent_json JSONB,
         updated_at TIMESTAMPTZ NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS events (
         id TEXT PRIMARY KEY,
+        university_id TEXT REFERENCES universities(id),
         starts_at TIMESTAMPTZ NOT NULL,
         data_json JSONB NOT NULL
       );
@@ -254,21 +322,44 @@ export class DatabaseStore {
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL
       );
+    `);
 
+    await this.pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS university_id TEXT');
+    await this.pool.query('ALTER TABLE events ADD COLUMN IF NOT EXISTS university_id TEXT');
+    await this.pool.query(`
+      CREATE INDEX IF NOT EXISTS events_university_id_idx ON events(university_id);
+      CREATE INDEX IF NOT EXISTS users_role_idx ON users(role);
+      CREATE INDEX IF NOT EXISTS users_university_id_idx ON users(university_id);
       CREATE INDEX IF NOT EXISTS registrations_event_id_idx ON registrations(event_id);
       CREATE INDEX IF NOT EXISTS registrations_user_id_idx ON registrations(user_id);
     `);
+  }
+
+  private async seedUniversities(): Promise<void> {
+    for (const university of seedUniversities) {
+      await this.pool.query(
+        [
+          'INSERT INTO universities (id, title, short_title, city, description)',
+          'VALUES ($1, $2, $3, $4, $5)',
+          'ON CONFLICT(id) DO UPDATE SET',
+          'title = EXCLUDED.title, short_title = EXCLUDED.short_title,',
+          'city = EXCLUDED.city, description = EXCLUDED.description'
+        ].join(' '),
+        [university.id, university.title, university.shortTitle, university.city, university.description]
+      );
+    }
   }
 
   private async seedEvents(): Promise<void> {
     for (const event of seedEvents) {
       await this.pool.query(
         [
-          'INSERT INTO events (id, starts_at, data_json)',
-          'VALUES ($1, $2, $3)',
-          'ON CONFLICT(id) DO UPDATE SET starts_at = EXCLUDED.starts_at, data_json = EXCLUDED.data_json'
+          'INSERT INTO events (id, university_id, starts_at, data_json)',
+          'VALUES ($1, $2, $3, $4)',
+          'ON CONFLICT(id) DO UPDATE SET',
+          'university_id = EXCLUDED.university_id, starts_at = EXCLUDED.starts_at, data_json = EXCLUDED.data_json'
         ].join(' '),
-        [event.id, event.startsAt, JSON.stringify(event)]
+        [event.id, event.universityId, event.startsAt, JSON.stringify(event)]
       );
     }
   }
@@ -277,16 +368,22 @@ export class DatabaseStore {
     return typeof value === 'string' ? (JSON.parse(value) as EventCard) : value;
   }
 
-  private mapUser(row: DbUserRow): StoredUser {
-    const consent =
-      typeof row.consent_json === 'string' ? JSON.parse(row.consent_json) : row.consent_json ?? undefined;
+  private parseJson<T>(value: string | object | null): T | undefined {
+    if (!value) {
+      return undefined;
+    }
 
+    return typeof value === 'string' ? (JSON.parse(value) as T) : (value as T);
+  }
+
+  private mapUser(row: DbUserRow): StoredUser {
     return {
       id: Number(row.id),
       name: row.name,
       username: row.username ?? undefined,
       role: row.role,
-      consent,
+      universityId: row.university_id ?? undefined,
+      consent: this.parseJson(row.consent_json),
       updatedAt: new Date(row.updated_at).toISOString()
     };
   }
@@ -303,6 +400,16 @@ export class DatabaseStore {
       notificationsEnabled: row.notifications_enabled,
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString()
+    };
+  }
+
+  private mapUniversity(row: DbUniversityRow): University {
+    return {
+      id: row.id,
+      title: row.title,
+      shortTitle: row.short_title,
+      city: row.city,
+      description: row.description
     };
   }
 }

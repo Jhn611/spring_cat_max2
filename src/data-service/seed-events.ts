@@ -3,6 +3,7 @@ import type { EventCard } from '../shared/types.js';
 export const events: EventCard[] = [
   {
     id: 'open-day-it',
+    universityId: 'rtu-mirea',
     title: 'День открытых дверей ИТ-направлений',
     startsAt: '2026-05-28T15:00:00+03:00',
     durationMinutes: 90,
@@ -23,6 +24,7 @@ export const events: EventCard[] = [
   },
   {
     id: 'campus-tour',
+    universityId: 'rtu-mirea',
     title: 'Экскурсия по кампусу',
     startsAt: '2026-05-30T12:00:00+03:00',
     durationMinutes: 60,
@@ -40,6 +42,7 @@ export const events: EventCard[] = [
   },
   {
     id: 'online-consulting',
+    universityId: 'spring-demo',
     title: 'Онлайн-консультация по поступлению',
     startsAt: '2026-06-02T18:00:00+03:00',
     durationMinutes: 45,

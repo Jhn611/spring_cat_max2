@@ -26,7 +26,17 @@ const route: Handler = async (req, res, url) => {
   const path = decodeURIComponent(url.pathname);
 
   if (req.method === 'GET' && path === '/health') return sendJson(res, 200, { ok: true });
-  if (req.method === 'GET' && path === '/events') return sendJson(res, 200, await store.listEvents());
+  if (req.method === 'GET' && path === '/universities') return sendJson(res, 200, await store.listUniversities());
+
+  const universityMatch = path.match(/^\/universities\/([^/]+)$/);
+  if (req.method === 'GET' && universityMatch) {
+    const university = await store.getUniversity(universityMatch[1]);
+    return university ? sendJson(res, 200, university) : sendJson(res, 404, { error: 'not_found' });
+  }
+
+  if (req.method === 'GET' && path === '/events') {
+    return sendJson(res, 200, await store.listEvents(url.searchParams.get('universityId') ?? undefined));
+  }
   if (req.method === 'GET' && path === '/events/manageable') {
     const userId = Number(url.searchParams.get('userId'));
     const role = (url.searchParams.get('role') ?? 'applicant') as Role;
@@ -52,7 +62,8 @@ const route: Handler = async (req, res, url) => {
 
   if (req.method === 'GET' && path === '/users') {
     const role = url.searchParams.get('role') as Role | null;
-    return sendJson(res, 200, await store.listUsers(role ?? undefined));
+    const universityId = url.searchParams.get('universityId') ?? undefined;
+    return sendJson(res, 200, await store.listUsers(role ?? undefined, universityId));
   }
 
   if (req.method === 'POST' && path === '/users/upsert') {
@@ -62,8 +73,8 @@ const route: Handler = async (req, res, url) => {
 
   const roleMatch = path.match(/^\/users\/(\d+)\/role$/);
   if (req.method === 'PATCH' && roleMatch) {
-    const body = await readJson<{ role: Role }>(req);
-    return sendJson(res, 200, await store.setUserRole(Number(roleMatch[1]), body.role));
+    const body = await readJson<{ role: Role; universityId?: string | null }>(req);
+    return sendJson(res, 200, await store.setUserRole(Number(roleMatch[1]), body.role, body.universityId));
   }
 
   if (req.method === 'GET' && path === '/registrations') {

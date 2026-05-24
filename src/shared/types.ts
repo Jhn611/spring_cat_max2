@@ -2,6 +2,14 @@ export type Role = 'applicant' | 'organizer' | 'admin' | 'tech_admin';
 
 export type EventFormat = 'online' | 'offline';
 
+export type University = {
+  id: string;
+  title: string;
+  shortTitle: string;
+  city: string;
+  description: string;
+};
+
 export type EventSlot = {
   id: string;
   label: string;
@@ -10,6 +18,7 @@ export type EventSlot = {
 
 export type EventCard = {
   id: string;
+  universityId: string;
   title: string;
   startsAt: string;
   durationMinutes: number;
@@ -56,6 +65,7 @@ export type StoredUser = {
   name: string;
   username?: string;
   role: Role;
+  universityId?: string;
   consent?: UserConsent;
   updatedAt: string;
 };

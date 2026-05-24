@@ -1,10 +1,19 @@
-import type { EventCard, Registration, Role, StoredUser } from '../shared/types.js';
+import type { EventCard, Registration, Role, StoredUser, University } from '../shared/types.js';
 
 export class DataServiceClient {
   constructor(private readonly baseUrl: string) {}
 
-  listEvents(): Promise<EventCard[]> {
-    return this.request('/events');
+  listUniversities(): Promise<University[]> {
+    return this.request('/universities');
+  }
+
+  getUniversity(universityId: string): Promise<University | undefined> {
+    return this.requestOrUndefined(`/universities/${encodeURIComponent(universityId)}`);
+  }
+
+  listEvents(universityId?: string): Promise<EventCard[]> {
+    const query = universityId ? `?universityId=${encodeURIComponent(universityId)}` : '';
+    return this.request(`/events${query}`);
   }
 
   getEvent(eventId: string): Promise<EventCard | undefined> {
@@ -24,8 +33,11 @@ export class DataServiceClient {
     return this.requestOrUndefined(`/users/${userId}`);
   }
 
-  listUsers(role?: Role): Promise<StoredUser[]> {
-    const query = role ? `?role=${encodeURIComponent(role)}` : '';
+  listUsers(role?: Role, universityId?: string): Promise<StoredUser[]> {
+    const params = new URLSearchParams();
+    if (role) params.set('role', role);
+    if (universityId) params.set('universityId', universityId);
+    const query = params.size > 0 ? `?${params.toString()}` : '';
     return this.request(`/users${query}`);
   }
 
@@ -33,8 +45,8 @@ export class DataServiceClient {
     return this.request('/users/upsert', { method: 'POST', body: user });
   }
 
-  setUserRole(userId: number, role: Role): Promise<StoredUser> {
-    return this.request(`/users/${userId}/role`, { method: 'PATCH', body: { role } });
+  setUserRole(userId: number, role: Role, universityId?: string | null): Promise<StoredUser> {
+    return this.request(`/users/${userId}/role`, { method: 'PATCH', body: { role, universityId } });
   }
 
   createRegistration(registration: Registration): Promise<Registration> {

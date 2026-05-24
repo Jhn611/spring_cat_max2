@@ -4,8 +4,9 @@ HTTP API and database owner.
 
 Responsibilities:
 
-- expose events, users, registrations, free seats and organizer operations;
+- expose universities, events, users, registrations, free seats and organizer operations;
 - own Postgres access through `database.ts`;
+- seed demo universities from `seed-universities.ts`;
 - seed demo events from `seed-events.ts`;
 - hide persistence details from the bot.
 
