@@ -54,6 +54,7 @@ MAX_BOT_TOKEN=полный_токен_бота
 DATA_SERVICE_URL=http://localhost:3060
 DATA_SERVICE_PORT=3060
 DATABASE_URL=postgres://springcat:springcat@localhost:5432/springcat
+LOG_LEVEL=info
 TECH_ADMIN_MAX_IDS=ваш_max_id
 ADMIN_MAX_IDS=ваш_max_id
 ADMIN_UNIVERSITY_ID=rtu-mirea
@@ -61,6 +62,15 @@ LEGAL_DOC_VERSION=hackathon-2026-05-14
 ```
 
 В Docker `DATA_SERVICE_URL` можно оставить как в примере: `docker-compose.yml` сам переопределит его для контейнера бота на `http://data-service:3060`.
+
+Логи пишутся в stdout/stderr контейнеров в JSON-формате. Смотреть их можно так:
+
+```bash
+docker compose logs -f data-service
+docker compose logs -f bot
+```
+
+Уровень логов задается через `LOG_LEVEL`: обычно `info`, для подробной диагностики `debug`, для почти полной тишины `error`.
 
 Чтобы узнать свой MAX ID, запустите бота и отправьте `/whoami`.
 
@@ -121,14 +131,20 @@ TECH_ADMIN_MAX_IDS=ваш_max_id
 
 ## Настройка мероприятий
 
-Демо-мероприятия находятся в `src/data-service/seed-events.ts`.
+Вузы, мероприятия и слоты хранятся в Postgres:
+
+- `universities` - вузы;
+- `events` - мероприятия;
+- `event_slots` - слоты мероприятий.
+
+TS-файлов с сидами больше нет. Если нужно поменять мероприятия, меняй строки в БД. Bootstrap-демо создается только как стартовые строки при миграции, чтобы новая база не была пустой.
 
 ## Архитектура
 
 Теперь бот и данные разделены:
 
 - `src/bot` - модуль бота MAX. Он не работает с БД напрямую и обращается к `DATA_SERVICE_URL`.
-- `src/data-service` - модуль сервиса данных: HTTP API, Postgres-слой, сиды вузов и мероприятий.
+- `src/data-service` - модуль сервиса данных: HTTP API и Postgres-слой.
 - `src/shared` - общий контракт: типы и доменные утилиты без зависимости от бота или БД.
 - `Dockerfile` - собирает общий production-образ для обоих runtime-модулей.
 - `docker-compose.yml` - запускает три контейнера: `postgres`, `data-service` и `bot`.
@@ -150,9 +166,9 @@ TECH_ADMIN_MAX_IDS=ваш_max_id
 
 - поднимает HTTP API на `DATA_SERVICE_PORT`;
 - ходит в Postgres по `DATABASE_URL`;
-- создает таблицы вузов, пользователей, мероприятий и записей;
+- создает таблицы вузов, пользователей, мероприятий, слотов и записей;
 - хранит привязку админов и организаторов к вузам;
-- сидит демо-мероприятия из `src/data-service/seed-events.ts`;
+- создает стартовые демо-строки прямо в Postgres при миграции;
 - считает свободные места и отдает записи/статусы боту.
 
 `src/shared`
@@ -177,7 +193,7 @@ TECH_ADMIN_MAX_IDS=ваш_max_id
 - порт наружу: `3060`;
 - ждет healthy-состояния `postgres`;
 - подключается к БД по внутреннему адресу Docker: `postgres://springcat:springcat@postgres:5432/springcat`;
-- выполняет миграции и сидит демо-мероприятия при старте.
+- выполняет миграции и создает стартовые демо-строки при старте.
 
 `bot`
 

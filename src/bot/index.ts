@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
 import { Bot, Keyboard, type Context } from '@maxhub/max-bot-api';
 import { DataServiceClient } from './data-service-client.js';
+import { logger } from './logger.js';
 import { isActiveStatus } from '../shared/domain.js';
 import type { EventCard, Registration, RegistrationStatus, Role, StoredUser, University } from '../shared/types.js';
 
@@ -17,6 +18,16 @@ const legalDocVersion = process.env.LEGAL_DOC_VERSION ?? 'hackathon-2026-05-14';
 const adminIds = parseIdSet(process.env.ADMIN_MAX_IDS);
 const techAdminIds = parseIdSet(process.env.TECH_ADMIN_MAX_IDS ?? process.env.MAIN_ADMIN_MAX_IDS);
 const bootstrapAdminUniversityId = process.env.ADMIN_UNIVERSITY_ID ?? process.env.DEFAULT_UNIVERSITY_ID;
+
+logger.info(
+  {
+    dataServiceUrl: process.env.DATA_SERVICE_URL ?? 'http://localhost:3060',
+    legalDocVersion,
+    adminIdsCount: adminIds.size,
+    techAdminIdsCount: techAdminIds.size
+  },
+  'initializing bot'
+);
 
 type AnyContext = Context<any>;
 type ReplyExtra = Parameters<AnyContext['reply']>[1];
@@ -192,6 +203,17 @@ async function freeSeats(event: EventCard): Promise<number> {
 
 function getSender(ctx: AnyContext) {
   return ctx.user ?? ctx.message?.sender ?? ctx.callback?.user;
+}
+
+function logContext(ctx: AnyContext) {
+  const sender = getSender(ctx);
+
+  return {
+    userId: sender?.user_id,
+    chatId: ctx.chatId ?? ctx.message?.recipient.chat_id,
+    messageId: ctx.messageId,
+    callbackPayload: ctx.callback?.payload
+  };
 }
 
 function roleFor(userId: number, saved?: StoredUser): Role {
@@ -1021,16 +1043,33 @@ await bot.api.setMyCommands([
 ]);
 
 bot.on('bot_started', async (ctx) => {
+  logger.info(logContext(ctx), 'bot started conversation');
   await rememberUser(ctx);
   await showWelcome(ctx);
 });
 
-bot.command('start', async (ctx) => showMainMenu(ctx));
-bot.command('events', async (ctx) => showCatalog(ctx));
-bot.command('my', async (ctx) => showMyRegistrations(ctx));
-bot.command('org', async (ctx) => showOrganizerMenu(ctx));
-bot.command('admin', async (ctx) => showAdminPanel(ctx));
+bot.command('start', async (ctx) => {
+  logger.info(logContext(ctx), 'command start');
+  await showMainMenu(ctx);
+});
+bot.command('events', async (ctx) => {
+  logger.info(logContext(ctx), 'command events');
+  await showCatalog(ctx);
+});
+bot.command('my', async (ctx) => {
+  logger.info(logContext(ctx), 'command my');
+  await showMyRegistrations(ctx);
+});
+bot.command('org', async (ctx) => {
+  logger.info(logContext(ctx), 'command org');
+  await showOrganizerMenu(ctx);
+});
+bot.command('admin', async (ctx) => {
+  logger.info(logContext(ctx), 'command admin');
+  await showAdminPanel(ctx);
+});
 bot.command('whoami', async (ctx) => {
+  logger.info(logContext(ctx), 'command whoami');
   const user = await rememberUser(ctx);
   await ctx.reply(user ? `Ваш MAX ID: ${user.id}` : 'Не удалось определить MAX ID.');
 });
@@ -1071,6 +1110,7 @@ bot.action(/.*/, async (ctx) => {
   await rememberUser(ctx);
 
   const payload = ctx.callback?.payload ?? '';
+  logger.info({ ...logContext(ctx), payloadScope: payload.split(':')[0] }, 'callback action');
   const [scope, a, b, c, d] = payload.split(':');
 
   if (payload === 'consent:accept') {
@@ -1134,11 +1174,22 @@ bot.on('message_created', async (ctx) => {
     return;
   }
 
+  logger.info(logContext(ctx), 'plain message received');
   await showMainMenu(ctx);
 });
 
 bot.catch((error) => {
-  console.error(error);
+  logger.error({ err: error }, 'bot handler failed');
 });
 
+process.on('unhandledRejection', (reason) => {
+  logger.error({ err: reason }, 'unhandled promise rejection');
+});
+
+process.on('uncaughtException', (error) => {
+  logger.fatal({ err: error }, 'uncaught exception');
+  process.exitCode = 1;
+});
+
+logger.info('starting bot polling');
 await bot.start();
