@@ -4,7 +4,17 @@ import { Bot, Keyboard, type Context } from '@maxhub/max-bot-api';
 import { DataServiceClient } from './data-service-client.js';
 import { logger } from './logger.js';
 import { isActiveStatus } from '../shared/domain.js';
-import type { EventCard, Registration, RegistrationStatus, Role, StoredUser, University } from '../shared/types.js';
+import type {
+  CreateEventInput,
+  EventCard,
+  EventFormat,
+  Registration,
+  RegistrationStatus,
+  Role,
+  StoredUser,
+  UpdateEventInput,
+  University
+} from '../shared/types.js';
 
 const token = process.env.MAX_BOT_TOKEN;
 
@@ -54,7 +64,8 @@ const notificationTemplates = {
   hour: 'Напоминание: мероприятие начнется примерно через час.',
   time: 'Обновление по мероприятию: время изменилось. Проверьте актуальную информацию у организатора.',
   room: 'Обновление по мероприятию: изменилась аудитория или место сбора.',
-  link: 'Обновление по мероприятию: ссылка на подключение будет отправлена организатором отдельно.'
+  link: 'Обновление по мероприятию: ссылка на подключение будет отправлена организатором отдельно.',
+  details: 'Обновление по мероприятию: изменились детали мероприятия. Проверьте актуальную информацию в боте.'
 } as const;
 
 function rows(buttons: ReturnType<typeof Keyboard.button.callback>[][]) {
@@ -177,6 +188,7 @@ function formatEvent(event: EventCard, freeSeats: number, university?: Universit
 
   return [
     event.title,
+    ...(event.deletedAt ? ['Статус: удалено, скрыто из каталога'] : []),
     `Вуз: ${university?.shortTitle ?? event.universityId}`,
     `Дата: ${formatDate(event.startsAt)}`,
     `Длительность: ${formatDuration(event.durationMinutes)}`,
@@ -403,6 +415,11 @@ async function showEventDetails(ctx: AnyContext, eventId: string) {
     return;
   }
 
+  if (event.deletedAt) {
+    await renderSingle(ctx, 'Мероприятие сейчас недоступно.', rows([[button('Все мероприятия', 'catalog')], [button('Главное меню', 'menu')]]));
+    return;
+  }
+
   const seats = await freeSeats(event);
   const university = await store.getUniversity(event.universityId);
   const text = [
@@ -428,7 +445,7 @@ async function startEnrollment(ctx: AnyContext, eventId: string) {
   const user = await requireConsent(ctx);
   const event = await eventById(eventId);
 
-  if (!user || !event) {
+  if (!user || !event || event.deletedAt) {
     await renderSingle(ctx, 'Не удалось начать запись.', rows([[button('Назад', 'catalog')]]));
     return;
   }
@@ -645,6 +662,187 @@ function canManage(user: StoredUser, event: EventCard): boolean {
   return (user.role === 'admin' || user.role === 'organizer') && user.universityId === event.universityId;
 }
 
+function canCreateEvent(user: StoredUser): boolean {
+  return user.role === 'organizer' || user.role === 'admin' || user.role === 'tech_admin';
+}
+
+function canEditEvent(user: StoredUser, event: EventCard): boolean {
+  if (user.role === 'tech_admin') {
+    return true;
+  }
+
+  return (user.role === 'organizer' || user.role === 'admin') && user.universityId === event.universityId;
+}
+
+function canDeleteEvent(user: StoredUser, event: EventCard): boolean {
+  if (user.role === 'tech_admin') {
+    return true;
+  }
+
+  return (user.role === 'organizer' || user.role === 'admin') && user.universityId === event.universityId;
+}
+
+function eventCreateHelp(universityId?: string): string {
+  return [
+    'Создание мероприятия',
+    '',
+    'Отправьте команду в формате:',
+    '/org_create Название | 2026-06-15 15:00 | 60 | offline | 30 | Место или ссылка | Описание',
+    '',
+    'Формат: online или offline.',
+    `Вуз: ${universityId ?? 'для техадмина укажите university_id последним полем'}`,
+    '',
+    'Для техадмина:',
+    '/org_create Название | 2026-06-15 15:00 | 60 | online | 30 | Ссылка | Описание | university_id'
+  ].join('\n');
+}
+
+function eventEditHelp(eventId?: string): string {
+  const prefix = eventId ?? 'event_id';
+
+  return [
+    'Изменение мероприятия',
+    '',
+    'Отправьте команду:',
+    `/org_edit ${prefix} | поле | новое значение`,
+    '',
+    'Поля:',
+    'title, date, duration, format, capacity, place, description, requirements, cancelPolicy, registrationClosed, lateCancelAllowed',
+    '',
+    'Пример:',
+    `/org_edit ${prefix} | place | Главный корпус, аудитория 305`
+  ].join('\n');
+}
+
+function parseEventDate(raw: string): string | undefined {
+  const normalized = raw.trim().replace(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})$/, '$1T$2:00+03:00');
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function parseCreateEventInput(raw: string, user: StoredUser): CreateEventInput | string {
+  const parts = raw.split('|').map((part) => part.trim());
+  const [title, startsAtRaw, durationRaw, formatRaw, capacityRaw, locationOrUrl, description, universityIdRaw] = parts;
+  const universityId = user.role === 'tech_admin' ? universityIdRaw : user.universityId;
+
+  if (!title || !startsAtRaw || !durationRaw || !formatRaw || !capacityRaw || !locationOrUrl || !description) {
+    return 'Не хватает полей. Проверьте шаблон команды.';
+  }
+
+  if (!universityId) {
+    return 'Не удалось определить вуз. Для техадмина укажите university_id последним полем.';
+  }
+
+  const format = formatRaw.toLowerCase() as EventFormat;
+
+  if (format !== 'online' && format !== 'offline') {
+    return 'Формат должен быть online или offline.';
+  }
+
+  const startsAt = parseEventDate(startsAtRaw);
+
+  if (!startsAt) {
+    return 'Дата не распознана. Используйте формат 2026-06-15 15:00.';
+  }
+
+  const durationMinutes = Number(durationRaw);
+  const capacity = Number(capacityRaw);
+
+  if (!Number.isInteger(durationMinutes) || durationMinutes <= 0) {
+    return 'Длительность должна быть целым числом минут больше нуля.';
+  }
+
+  if (!Number.isInteger(capacity) || capacity <= 0) {
+    return 'Лимит мест должен быть целым числом больше нуля.';
+  }
+
+  return {
+    universityId,
+    title,
+    startsAt,
+    durationMinutes,
+    format,
+    capacity,
+    locationOrUrl,
+    description,
+    requirements: 'Подтверждение записи с кодом.',
+    cancelPolicy: 'Отмена доступна до начала мероприятия.',
+    registrationClosed: false,
+    lateCancelAllowed: false,
+    slots: []
+  };
+}
+
+function parseBoolean(raw: string): boolean | undefined {
+  const value = raw.trim().toLowerCase();
+
+  if (['true', 'yes', 'да', '1', 'on'].includes(value)) {
+    return true;
+  }
+
+  if (['false', 'no', 'нет', '0', 'off'].includes(value)) {
+    return false;
+  }
+
+  return undefined;
+}
+
+function parseEditEventInput(raw: string): { eventId: string; patch: UpdateEventInput; label: string } | string {
+  const [eventId = '', fieldRaw = '', ...valueParts] = raw.split('|').map((part) => part.trim());
+  const value = valueParts.join('|').trim();
+  const field = fieldRaw.toLowerCase();
+
+  if (!eventId || !field || !value) {
+    return 'Не хватает полей. Используйте: /org_edit event_id | поле | новое значение';
+  }
+
+  if (field === 'title') return { eventId, patch: { title: value }, label: 'название' };
+  if (field === 'description') return { eventId, patch: { description: value }, label: 'описание' };
+  if (field === 'requirements') return { eventId, patch: { requirements: value }, label: 'требования' };
+  if (field === 'cancelpolicy') return { eventId, patch: { cancelPolicy: value }, label: 'правила отмены' };
+  if (field === 'place' || field === 'location' || field === 'url') return { eventId, patch: { locationOrUrl: value }, label: 'место или ссылка' };
+
+  if (field === 'date' || field === 'startsat') {
+    const startsAt = parseEventDate(value);
+    return startsAt ? { eventId, patch: { startsAt }, label: 'дата и время' } : 'Дата не распознана. Используйте формат 2026-06-15 15:00.';
+  }
+
+  if (field === 'duration') {
+    const durationMinutes = Number(value);
+    return Number.isInteger(durationMinutes) && durationMinutes > 0
+      ? { eventId, patch: { durationMinutes }, label: 'длительность' }
+      : 'Длительность должна быть целым числом минут больше нуля.';
+  }
+
+  if (field === 'capacity') {
+    const capacity = Number(value);
+    return Number.isInteger(capacity) && capacity > 0 ? { eventId, patch: { capacity }, label: 'лимит мест' } : 'Лимит мест должен быть целым числом больше нуля.';
+  }
+
+  if (field === 'format') {
+    const format = value.toLowerCase() as EventFormat;
+    return format === 'online' || format === 'offline' ? { eventId, patch: { format }, label: 'формат' } : 'Формат должен быть online или offline.';
+  }
+
+  if (field === 'registrationclosed') {
+    const registrationClosed = parseBoolean(value);
+    return registrationClosed === undefined ? 'Значение должно быть true/false или да/нет.' : { eventId, patch: { registrationClosed }, label: 'статус регистрации' };
+  }
+
+  if (field === 'latecancelallowed') {
+    const lateCancelAllowed = parseBoolean(value);
+    return lateCancelAllowed === undefined ? 'Значение должно быть true/false или да/нет.' : { eventId, patch: { lateCancelAllowed }, label: 'поздняя отмена' };
+  }
+
+  return `Поле "${fieldRaw}" не поддерживается.`;
+}
+
+function changeNotificationKind(patch: UpdateEventInput): keyof typeof notificationTemplates {
+  if (patch.startsAt) return 'time';
+  if (patch.locationOrUrl) return patch.locationOrUrl.startsWith('http') ? 'link' : 'room';
+  return 'details';
+}
+
 async function showOrganizerMenu(ctx: AnyContext) {
   const user = await requireConsent(ctx);
 
@@ -656,22 +854,68 @@ async function showOrganizerMenu(ctx: AnyContext) {
   const manageable = await store.listManageableEvents(user.id, user.role);
 
   if (manageable.length === 0) {
-    await renderSingle(ctx, 'За вами пока не закреплены мероприятия.', rows([[button('Главное меню', 'menu')]]));
+    await renderSingle(
+      ctx,
+      ['За вами пока не закреплены мероприятия.', '', canCreateEvent(user) ? eventCreateHelp(user.universityId) : 'Доступных мероприятий пока нет.'].join('\n'),
+      rows([...(canCreateEvent(user) ? [[button('Создать мероприятие', 'org:create')]] : []), [button('Главное меню', 'menu')]])
+    );
     return;
   }
 
   await renderSingle(
     ctx,
-    'Ваши мероприятия:',
-    rows([...manageable.map((event) => [button(event.title, `org:event:${event.id}`)]), [button('Назад', 'menu')]])
+    ['Ваши мероприятия:', '', canCreateEvent(user) ? 'Создать новое можно командой /org_create. Изменить можно командой /org_edit.' : 'Доступные действия откроются в карточке мероприятия.'].join('\n'),
+    rows([
+      ...(canCreateEvent(user) ? [[button('Создать мероприятие', 'org:create')]] : []),
+      ...manageable.map((event) => [button(`${event.deletedAt ? '[Удалено] ' : ''}${event.title}`, `org:event:${event.id}`)]),
+      [button('Назад', 'menu')]
+    ])
   );
+}
+
+async function showCreateEventHelp(ctx: AnyContext) {
+  const user = await requireConsent(ctx);
+
+  if (!user || !canCreateEvent(user)) {
+    await renderSingle(ctx, 'Создание мероприятий доступно только организатору, админу своего вуза или техадмину.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  await renderSingle(ctx, eventCreateHelp(user.universityId), rows([[button('Назад', 'org')]]));
+}
+
+async function createEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
+  const user = await requireConsent(ctx);
+
+  if (!user || !canCreateEvent(user)) {
+    await renderSingle(ctx, 'Создание мероприятий доступно только организатору, админу своего вуза или техадмину.', rows([[button('Главное меню', 'menu')]]));
+    return;
+  }
+
+  const input = parseCreateEventInput(raw, user);
+
+  if (typeof input === 'string') {
+    await renderSingle(ctx, [input, '', eventCreateHelp(user.universityId)].join('\n'), rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const university = await store.getUniversity(input.universityId);
+
+  if (!university) {
+    await renderSingle(ctx, `Вуз ${input.universityId} не найден.`, rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const event = await store.createEvent(input);
+  logger.info({ eventId: event.id, userId: user.id, universityId: event.universityId }, 'event created by organizer');
+  await renderSingle(ctx, `Мероприятие создано:\n${formatEvent(event, event.capacity, university)}`, rows([[button('Открыть', `org:event:${event.id}`)], [button('Назад', 'org')]]));
 }
 
 async function showOrganizerEvent(ctx: AnyContext, eventId: string) {
   const user = await requireConsent(ctx);
   const event = await eventById(eventId);
 
-  if (!user || !event || !canManage(user, event)) {
+  if (!user || !event || (!canEditEvent(user, event) && !canDeleteEvent(user, event))) {
     await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
     return;
   }
@@ -683,6 +927,7 @@ async function showOrganizerEvent(ctx: AnyContext, eventId: string) {
     ctx,
     [
       event.title,
+      event.deletedAt ? `Статус: удалено ${formatDate(event.deletedAt)}` : 'Статус: активно',
       `Лимит: ${event.capacity}`,
       `Активных записей: ${active}`,
       `Свободно: ${Math.max(event.capacity - active, 0)}`,
@@ -690,11 +935,134 @@ async function showOrganizerEvent(ctx: AnyContext, eventId: string) {
       'Для поиска отправьте: /find КОД'
     ].join('\n'),
     rows([
-      [button('Список записей', `org:regs:${event.id}`)],
-      [button('Уведомления', `org:notify:${event.id}`)],
+      ...(canEditEvent(user, event) ? [[button('Список записей', `org:regs:${event.id}`)]] : []),
+      ...(canEditEvent(user, event) && !event.deletedAt ? [[button('Уведомления', `org:notify:${event.id}`)]] : []),
+      ...(canEditEvent(user, event) && !event.deletedAt ? [[button('Изменить мероприятие', `org:edit:${event.id}`)]] : []),
+      ...(event.deletedAt && canDeleteEvent(user, event) ? [[button('Восстановить мероприятие', `org:restore:${event.id}`, 'positive')]] : []),
+      ...(!event.deletedAt && canDeleteEvent(user, event) ? [[button('Удалить мероприятие', `org:delete:${event.id}`, 'negative')]] : []),
       [button('Назад', 'org')]
     ])
   );
+}
+
+async function showEditEventHelp(ctx: AnyContext, eventId: string) {
+  const user = await requireConsent(ctx);
+  const event = await eventById(eventId);
+
+  if (!user || !event || !canEditEvent(user, event)) {
+    await renderSingle(ctx, 'Изменение доступно только организатору или админу своего вуза, а также техадмину.', rows([[button('Назад', `org:event:${eventId}`)]]));
+    return;
+  }
+
+  if (event.deletedAt) {
+    await renderSingle(ctx, 'Удаленное мероприятие сначала нужно восстановить.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    return;
+  }
+
+  await renderSingle(ctx, eventEditHelp(event.id), rows([[button('Назад', `org:event:${event.id}`)]]));
+}
+
+async function updateEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
+  const user = await requireConsent(ctx);
+
+  if (!user) {
+    return;
+  }
+
+  const parsed = parseEditEventInput(raw);
+
+  if (typeof parsed === 'string') {
+    await renderSingle(ctx, [parsed, '', eventEditHelp()].join('\n'), rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const event = await eventById(parsed.eventId);
+
+  if (!event || !canEditEvent(user, event)) {
+    await renderSingle(ctx, 'Мероприятие не найдено или нет доступа на изменение.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  if (event.deletedAt) {
+    await renderSingle(ctx, 'Удаленное мероприятие сначала нужно восстановить.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    return;
+  }
+
+  const updated = await store.updateEvent(event.id, parsed.patch);
+
+  if (!updated) {
+    await renderSingle(ctx, 'Не удалось изменить мероприятие.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    return;
+  }
+
+  const notified = await sendAutomaticEventChangeNotification(updated, changeNotificationKind(parsed.patch), parsed.label);
+  logger.info({ eventId: updated.id, userId: user.id, universityId: updated.universityId, notified }, 'event updated by organizer');
+  await renderSingle(ctx, `Мероприятие изменено: ${parsed.label}.\nУведомлений отправлено: ${notified}.`, rows([[button('Открыть', `org:event:${updated.id}`)], [button('Назад', 'org')]]));
+}
+
+async function confirmDeleteOrganizerEvent(ctx: AnyContext, eventId: string) {
+  const user = await requireConsent(ctx);
+  const event = await eventById(eventId);
+
+  if (!user || !event || !canEditEvent(user, event)) {
+    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const active = (await store.listRegistrations(event.id)).filter((registration) => isActiveStatus(registration.status)).length;
+
+  await renderSingle(
+    ctx,
+    [
+      `Удалить мероприятие "${event.title}"?`,
+      `Активных записей: ${active}`,
+      active > 0 ? 'Записи сохранятся. Мероприятие будет скрыто из каталога и помечено удаленным.' : 'Мероприятие будет скрыто из каталога и помечено удаленным.'
+    ].join('\n'),
+    rows([
+      [button('Да, удалить', `org:delete-confirm:${event.id}`, 'negative')],
+      [button('Назад', `org:event:${event.id}`)]
+    ])
+  );
+}
+
+async function deleteOrganizerEvent(ctx: AnyContext, eventId: string) {
+  const user = await requireConsent(ctx);
+  const event = await eventById(eventId);
+
+  if (!user || !event || !canDeleteEvent(user, event)) {
+    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const result = await store.deleteEvent(event.id);
+
+  if (result === 'not_found') {
+    await renderSingle(ctx, 'Мероприятие уже удалено.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  logger.info({ eventId: event.id, userId: user.id, universityId: event.universityId }, 'event deleted by organizer');
+  await renderSingle(ctx, `Мероприятие "${event.title}" помечено удаленным. Записи участников сохранены.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+}
+
+async function restoreOrganizerEvent(ctx: AnyContext, eventId: string) {
+  const user = await requireConsent(ctx);
+  const event = await eventById(eventId);
+
+  if (!user || !event || !canDeleteEvent(user, event)) {
+    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const restored = await store.restoreEvent(event.id);
+
+  if (!restored) {
+    await renderSingle(ctx, 'Мероприятие не найдено.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  logger.info({ eventId: restored.id, userId: user.id, universityId: restored.universityId }, 'event restored by organizer');
+  await renderSingle(ctx, `Мероприятие "${restored.title}" восстановлено.`, rows([[button('Открыть', `org:event:${restored.id}`)], [button('Назад', 'org')]]));
 }
 
 async function showOrganizerRegistrations(ctx: AnyContext, eventId: string) {
@@ -725,7 +1093,7 @@ async function findRegistration(ctx: AnyContext, code: string) {
   const registration = await store.findRegistrationByCode(code);
   const event = registration ? await eventById(registration.eventId) : undefined;
 
-  if (!user || !registration || !event || !canManage(user, event)) {
+  if (!user || !registration || !event || !canEditEvent(user, event)) {
     await renderSingle(ctx, 'Запись не найдена или нет доступа.', rows([[button('Назад', 'org')]]));
     return;
   }
@@ -753,7 +1121,7 @@ async function setOrganizerStatus(ctx: AnyContext, registrationId: string, statu
   const registration = (await store.listRegistrations()).find((item) => item.id === registrationId);
   const event = registration ? await eventById(registration.eventId) : undefined;
 
-  if (!user || !registration || !event || !canManage(user, event)) {
+  if (!user || !registration || !event || !canEditEvent(user, event)) {
     await renderSingle(ctx, 'Запись не найдена или нет доступа.', rows([[button('Назад', 'org')]]));
     return;
   }
@@ -766,7 +1134,7 @@ async function showNotifyMenu(ctx: AnyContext, eventId: string) {
   const user = await requireConsent(ctx);
   const event = await eventById(eventId);
 
-  if (!user || !event || !canManage(user, event)) {
+  if (!user || !event || !canEditEvent(user, event)) {
     await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
     return;
   }
@@ -789,7 +1157,7 @@ async function sendEventNotification(ctx: AnyContext, eventId: string, kind: key
   const user = await requireConsent(ctx);
   const event = await eventById(eventId);
 
-  if (!user || !event || !canManage(user, event)) {
+  if (!user || !event || !canEditEvent(user, event)) {
     await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
     return;
   }
@@ -806,6 +1174,31 @@ async function sendEventNotification(ctx: AnyContext, eventId: string, kind: key
   }
 
   await renderSingle(ctx, `Уведомление отправлено. Получателей: ${recipients.length}.`, rows([[button('Назад', `org:event:${event.id}`)]]));
+}
+
+async function sendAutomaticEventChangeNotification(
+  event: EventCard,
+  kind: keyof typeof notificationTemplates,
+  changedLabel: string
+): Promise<number> {
+  const recipients = (await store.listRegistrations(event.id)).filter(
+    (item) => isActiveStatus(item.status) && item.notificationsEnabled
+  );
+
+  for (const recipient of recipients) {
+    await bot.api.sendMessageToUser(
+      recipient.userId,
+      [
+        `Изменение по мероприятию "${event.title}"`,
+        notificationTemplates[kind],
+        `Изменено: ${changedLabel}`,
+        `Дата: ${formatDate(event.startsAt)}`,
+        `Адрес/ссылка: ${event.locationOrUrl}`
+      ].join('\n')
+    );
+  }
+
+  return recipients.length;
 }
 
 async function requireRoleAdmin(ctx: AnyContext): Promise<StoredUser | undefined> {
@@ -1033,6 +1426,8 @@ await bot.api.setMyCommands([
   { name: 'events', description: 'Каталог мероприятий' },
   { name: 'my', description: 'Мои записи' },
   { name: 'org', description: 'Меню организатора' },
+  { name: 'org_create', description: 'Создать мероприятие' },
+  { name: 'org_edit', description: 'Изменить мероприятие' },
   { name: 'admin', description: 'Админ-панель' },
   { name: 'admin_add', description: 'Назначить админа по MAX ID' },
   { name: 'admin_org', description: 'Назначить организатора по MAX ID' },
@@ -1063,6 +1458,28 @@ bot.command('my', async (ctx) => {
 bot.command('org', async (ctx) => {
   logger.info(logContext(ctx), 'command org');
   await showOrganizerMenu(ctx);
+});
+bot.command('org_create', async (ctx) => {
+  logger.info(logContext(ctx), 'command org_create');
+  const raw = ctx.message.body.text?.replace(/^\/org_create(?:@\S+)?\s*/i, '').trim() ?? '';
+
+  if (raw) {
+    await createEventFromOrganizerCommand(ctx, raw);
+    return;
+  }
+
+  await showCreateEventHelp(ctx);
+});
+bot.command('org_edit', async (ctx) => {
+  logger.info(logContext(ctx), 'command org_edit');
+  const raw = ctx.message.body.text?.replace(/^\/org_edit(?:@\S+)?\s*/i, '').trim() ?? '';
+
+  if (raw) {
+    await updateEventFromOrganizerCommand(ctx, raw);
+    return;
+  }
+
+  await renderSingle(ctx, eventEditHelp(), rows([[button('Назад', 'org')]]));
 });
 bot.command('admin', async (ctx) => {
   logger.info(logContext(ctx), 'command admin');
@@ -1145,6 +1562,7 @@ bot.action(/.*/, async (ctx) => {
   if (payload === 'universities') return showUniversities(ctx);
   if (payload === 'my') return showMyRegistrations(ctx);
   if (payload === 'org') return showOrganizerMenu(ctx);
+  if (scope === 'org' && a === 'create') return showCreateEventHelp(ctx);
   if (payload === 'admin') return showAdminPanel(ctx);
   if (scope === 'event') return showEventDetails(ctx, a);
   if (scope === 'university' && a === 'events') return showCatalog(ctx, b);
@@ -1156,8 +1574,12 @@ bot.action(/.*/, async (ctx) => {
   if (scope === 'unmute') return toggleNotifications(ctx, a, true);
 
   if (scope === 'org' && a === 'event') return showOrganizerEvent(ctx, b);
+  if (scope === 'org' && a === 'edit') return showEditEventHelp(ctx, b);
   if (scope === 'org' && a === 'regs') return showOrganizerRegistrations(ctx, b);
   if (scope === 'org' && a === 'notify') return showNotifyMenu(ctx, b);
+  if (scope === 'org' && a === 'delete') return confirmDeleteOrganizerEvent(ctx, b);
+  if (scope === 'org' && a === 'delete-confirm') return deleteOrganizerEvent(ctx, b);
+  if (scope === 'org' && a === 'restore') return restoreOrganizerEvent(ctx, b);
   if (scope === 'org' && a === 'status') return setOrganizerStatus(ctx, b, c as RegistrationStatus);
   if (scope === 'org' && a === 'send') return sendEventNotification(ctx, b, c as keyof typeof notificationTemplates);
   if (scope === 'admin' && a === 'list') return showUsersByRole(ctx, b as Role);

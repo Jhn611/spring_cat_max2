@@ -32,7 +32,30 @@ export type EventCard = {
   registrationClosed: boolean;
   lateCancelAllowed: boolean;
   slots: EventSlot[];
+  deletedAt?: string;
 };
+
+export type CreateEventInput = {
+  universityId: string;
+  title: string;
+  startsAt: string;
+  durationMinutes: number;
+  format: EventFormat;
+  capacity: number;
+  description: string;
+  requirements: string;
+  locationOrUrl: string;
+  cancelPolicy: string;
+  registrationClosed?: boolean;
+  lateCancelAllowed?: boolean;
+  slots?: EventSlot[];
+};
+
+export type UpdateEventInput = Partial<Omit<CreateEventInput, 'universityId' | 'slots'>> & {
+  universityId?: string;
+};
+
+export type DeleteEventResult = 'deleted' | 'not_found';
 
 export type RegistrationStatus =
   | 'confirmed'

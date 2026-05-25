@@ -1,4 +1,4 @@
-import type { EventCard, Registration, Role, StoredUser, University } from '../shared/types.js';
+import type { CreateEventInput, EventCard, Registration, Role, StoredUser, UpdateEventInput, University } from '../shared/types.js';
 
 export class DataServiceClient {
   constructor(private readonly baseUrl: string) {}
@@ -18,6 +18,32 @@ export class DataServiceClient {
 
   getEvent(eventId: string): Promise<EventCard | undefined> {
     return this.requestOrUndefined(`/events/${encodeURIComponent(eventId)}`);
+  }
+
+  createEvent(input: CreateEventInput): Promise<EventCard> {
+    return this.request('/events', { method: 'POST', body: input });
+  }
+
+  updateEvent(eventId: string, patch: UpdateEventInput): Promise<EventCard | undefined> {
+    return this.requestOrUndefined(`/events/${encodeURIComponent(eventId)}`, { method: 'PATCH', body: patch });
+  }
+
+  async deleteEvent(eventId: string): Promise<'deleted' | 'not_found'> {
+    const response = await this.fetch(`/events/${encodeURIComponent(eventId)}`, { method: 'DELETE' });
+
+    if (response.status === 204) {
+      return 'deleted';
+    }
+
+    if (response.status === 404) {
+      return 'not_found';
+    }
+
+    return this.parse(response);
+  }
+
+  restoreEvent(eventId: string): Promise<EventCard | undefined> {
+    return this.requestOrUndefined(`/events/${encodeURIComponent(eventId)}/restore`, { method: 'POST' });
   }
 
   listManageableEvents(userId: number, role: Role): Promise<EventCard[]> {
@@ -110,6 +136,6 @@ export class DataServiceClient {
 }
 
 type RequestOptions = {
-  method?: 'GET' | 'POST' | 'PATCH';
+  method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
   body?: unknown;
 };

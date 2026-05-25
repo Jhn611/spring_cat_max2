@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import { DatabaseStore } from './database.js';
-import type { Registration, Role, StoredUser } from '../shared/types.js';
+import type { CreateEventInput, Registration, Role, StoredUser, UpdateEventInput } from '../shared/types.js';
 
 const port = Number(process.env.DATA_SERVICE_PORT ?? 3060);
 const host = process.env.DATA_SERVICE_HOST ?? '0.0.0.0';
@@ -18,8 +18,10 @@ const app = Fastify({
 });
 
 app.setErrorHandler((error, _request, reply) => {
+  const fastifyError = error as { statusCode?: number; code?: string };
+
   app.log.error(error);
-  reply.status(500).send({ error: 'internal_error' });
+  reply.status(fastifyError.statusCode ?? 500).send({ error: fastifyError.code ?? 'internal_error' });
 });
 
 app.get('/health', async () => {
@@ -40,8 +42,8 @@ app.get<{ Params: { universityId: string } }>('/universities/:universityId', asy
   return university;
 });
 
-app.get<{ Querystring: { universityId?: string } }>('/events', async (request) => {
-  return store.listEvents(request.query.universityId);
+app.get<{ Querystring: { universityId?: string; includeDeleted?: string } }>('/events', async (request) => {
+  return store.listEvents(request.query.universityId, request.query.includeDeleted === 'true');
 });
 
 app.get<{ Querystring: { userId: string; role?: Role } }>('/events/manageable', async (request) => {
@@ -55,6 +57,45 @@ app.get<{ Params: { eventId: string } }>('/events/:eventId', async (request, rep
     return reply.status(404).send({ error: 'not_found' });
   }
 
+  return event;
+});
+
+app.post<{ Body: CreateEventInput }>('/events', async (request, reply) => {
+  const event = await store.createEvent(request.body);
+  app.log.info({ eventId: event.id, universityId: event.universityId }, 'event created');
+  return reply.status(201).send(event);
+});
+
+app.patch<{ Params: { eventId: string }; Body: UpdateEventInput }>('/events/:eventId', async (request, reply) => {
+  const event = await store.updateEvent(request.params.eventId, request.body);
+
+  if (!event) {
+    return reply.status(404).send({ error: 'not_found' });
+  }
+
+  app.log.info({ eventId: event.id, universityId: event.universityId }, 'event updated');
+  return event;
+});
+
+app.delete<{ Params: { eventId: string } }>('/events/:eventId', async (request, reply) => {
+  const result = await store.deleteEvent(request.params.eventId);
+
+  if (result === 'not_found') {
+    return reply.status(404).send({ error: result });
+  }
+
+  app.log.info({ eventId: request.params.eventId }, 'event soft deleted');
+  return reply.status(204).send();
+});
+
+app.post<{ Params: { eventId: string } }>('/events/:eventId/restore', async (request, reply) => {
+  const event = await store.restoreEvent(request.params.eventId);
+
+  if (!event) {
+    return reply.status(404).send({ error: 'not_found' });
+  }
+
+  app.log.info({ eventId: event.id, universityId: event.universityId }, 'event restored');
   return event;
 });
 

@@ -1,6 +1,17 @@
 import pg from 'pg';
 import { isActiveStatus } from '../shared/domain.js';
-import type { EventCard, EventFormat, EventSlot, Registration, Role, StoredUser, University } from '../shared/types.js';
+import type {
+  CreateEventInput,
+  DeleteEventResult,
+  EventCard,
+  EventFormat,
+  EventSlot,
+  Registration,
+  Role,
+  StoredUser,
+  UpdateEventInput,
+  University
+} from '../shared/types.js';
 
 const { Pool } = pg;
 
@@ -41,6 +52,7 @@ type DbEventRow = {
   cancel_policy: string;
   registration_closed: boolean;
   late_cancel_allowed: boolean;
+  deleted_at: Date | string | null;
 };
 
 type DbEventSlotRow = {
@@ -82,9 +94,20 @@ export class DatabaseStore {
     return rows[0] ? this.mapUniversity(rows[0]) : undefined;
   }
 
-  async listEvents(universityId?: string): Promise<EventCard[]> {
-    const params = universityId ? [universityId] : [];
-    const where = universityId ? 'WHERE university_id = $1' : '';
+  async listEvents(universityId?: string, includeDeleted = false): Promise<EventCard[]> {
+    const clauses: string[] = [];
+    const params: string[] = [];
+
+    if (universityId) {
+      params.push(universityId);
+      clauses.push(`university_id = $${params.length}`);
+    }
+
+    if (!includeDeleted) {
+      clauses.push('deleted_at IS NULL');
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const { rows } = await this.pool.query<DbEventRow>(`SELECT * FROM events ${where} ORDER BY starts_at`, params);
     return Promise.all(rows.map((row) => this.mapEvent(row)));
   }
@@ -94,9 +117,106 @@ export class DatabaseStore {
     return rows[0] ? this.mapEvent(rows[0]) : undefined;
   }
 
+  async createEvent(input: CreateEventInput): Promise<EventCard> {
+    const id = await this.nextEventId(input.title);
+
+    await this.pool.query(
+      [
+        'INSERT INTO events',
+        '(id, university_id, title, starts_at, duration_minutes, format, capacity, description, requirements, location_or_url, cancel_policy, registration_closed, late_cancel_allowed)',
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)'
+      ].join(' '),
+      [
+        id,
+        input.universityId,
+        input.title,
+        input.startsAt,
+        input.durationMinutes,
+        input.format,
+        input.capacity,
+        input.description,
+        input.requirements,
+        input.locationOrUrl,
+        input.cancelPolicy,
+        input.registrationClosed ?? false,
+        input.lateCancelAllowed ?? false
+      ]
+    );
+
+    for (const slot of input.slots ?? []) {
+      await this.pool.query(
+        [
+          'INSERT INTO event_slots (event_id, id, label, starts_at)',
+          'VALUES ($1, $2, $3, $4)'
+        ].join(' '),
+        [id, slot.id, slot.label, slot.startsAt]
+      );
+    }
+
+    const event = await this.getEvent(id);
+
+    if (!event) {
+      throw new Error(`Event ${id} was not created`);
+    }
+
+    return event;
+  }
+
+  async updateEvent(eventId: string, patch: UpdateEventInput): Promise<EventCard | undefined> {
+    const current = await this.getEvent(eventId);
+
+    if (!current) {
+      return undefined;
+    }
+
+    const next: EventCard = { ...current, ...patch };
+    await this.pool.query(
+      [
+        'UPDATE events SET',
+        'university_id = $1, title = $2, starts_at = $3, duration_minutes = $4, format = $5, capacity = $6,',
+        'description = $7, requirements = $8, location_or_url = $9, cancel_policy = $10, registration_closed = $11, late_cancel_allowed = $12',
+        'WHERE id = $13'
+      ].join(' '),
+      [
+        next.universityId,
+        next.title,
+        next.startsAt,
+        next.durationMinutes,
+        next.format,
+        next.capacity,
+        next.description,
+        next.requirements,
+        next.locationOrUrl,
+        next.cancelPolicy,
+        next.registrationClosed,
+        next.lateCancelAllowed,
+        eventId
+      ]
+    );
+
+    return this.getEvent(eventId);
+  }
+
+  async deleteEvent(eventId: string): Promise<DeleteEventResult> {
+    const event = await this.getEvent(eventId);
+
+    if (!event) {
+      return 'not_found';
+    }
+
+    await this.pool.query('UPDATE events SET deleted_at = COALESCE(deleted_at, NOW()) WHERE id = $1', [eventId]);
+
+    return 'deleted';
+  }
+
+  async restoreEvent(eventId: string): Promise<EventCard | undefined> {
+    await this.pool.query('UPDATE events SET deleted_at = NULL WHERE id = $1', [eventId]);
+    return this.getEvent(eventId);
+  }
+
   async listManageableEvents(userId: number, role: Role): Promise<EventCard[]> {
     const user = await this.getUser(userId);
-    const events = await this.listEvents();
+    const events = await this.listEvents(undefined, true);
 
     if (role === 'tech_admin') {
       return events;
@@ -298,6 +418,22 @@ export class DatabaseStore {
     return (await this.listRegistrations(eventId, userId)).find((item) => isActiveStatus(item.status));
   }
 
+  private async nextEventId(title: string): Promise<string> {
+    const base = slugify(title) || 'event';
+
+    for (let index = 0; index < 100; index += 1) {
+      const suffix = index === 0 ? '' : `-${index + 1}`;
+      const id = `${base}${suffix}`;
+      const { rows } = await this.pool.query<{ exists: boolean }>('SELECT EXISTS (SELECT 1 FROM events WHERE id = $1) AS exists', [id]);
+
+      if (!rows[0]?.exists) {
+        return id;
+      }
+    }
+
+    return `${base}-${Date.now().toString(36)}`;
+  }
+
   private async migrate(): Promise<void> {
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS universities (
@@ -359,6 +495,7 @@ export class DatabaseStore {
       ALTER TABLE events ADD COLUMN IF NOT EXISTS cancel_policy TEXT;
       ALTER TABLE events ADD COLUMN IF NOT EXISTS registration_closed BOOLEAN;
       ALTER TABLE events ADD COLUMN IF NOT EXISTS late_cancel_allowed BOOLEAN;
+      ALTER TABLE events ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     `);
 
     await this.migrateLegacyEventJson();
@@ -379,6 +516,7 @@ export class DatabaseStore {
       ALTER TABLE events ALTER COLUMN late_cancel_allowed SET NOT NULL;
 
       CREATE INDEX IF NOT EXISTS events_university_id_idx ON events(university_id);
+      CREATE INDEX IF NOT EXISTS events_deleted_at_idx ON events(deleted_at);
       CREATE INDEX IF NOT EXISTS event_slots_event_id_idx ON event_slots(event_id);
       CREATE INDEX IF NOT EXISTS users_role_idx ON users(role);
       CREATE INDEX IF NOT EXISTS users_university_id_idx ON users(university_id);
@@ -518,6 +656,7 @@ export class DatabaseStore {
       cancelPolicy: row.cancel_policy,
       registrationClosed: row.registration_closed,
       lateCancelAllowed: row.late_cancel_allowed,
+      deletedAt: row.deleted_at ? new Date(row.deleted_at).toISOString() : undefined,
       slots: slots.map((slot): EventSlot => ({
         id: slot.id,
         label: slot.label,
@@ -562,4 +701,53 @@ export class DatabaseStore {
       description: row.description
     };
   }
+}
+
+function slugify(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/ё/g, 'e')
+    .replace(/[а-я]/g, (letter) => {
+      const map: Record<string, string> = {
+        а: 'a',
+        б: 'b',
+        в: 'v',
+        г: 'g',
+        д: 'd',
+        е: 'e',
+        ж: 'zh',
+        з: 'z',
+        и: 'i',
+        й: 'y',
+        к: 'k',
+        л: 'l',
+        м: 'm',
+        н: 'n',
+        о: 'o',
+        п: 'p',
+        р: 'r',
+        с: 's',
+        т: 't',
+        у: 'u',
+        ф: 'f',
+        х: 'h',
+        ц: 'c',
+        ч: 'ch',
+        ш: 'sh',
+        щ: 'sch',
+        ъ: '',
+        ы: 'y',
+        ь: '',
+        э: 'e',
+        ю: 'yu',
+        я: 'ya'
+      };
+      return map[letter] ?? '';
+    });
+
+  return normalized
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
 }
