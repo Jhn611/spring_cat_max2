@@ -51,7 +51,7 @@ export type CreateEventInput = {
   slots?: EventSlot[];
 };
 
-export type UpdateEventInput = Partial<Omit<CreateEventInput, 'universityId' | 'slots'>> & {
+export type UpdateEventInput = Partial<CreateEventInput> & {
   universityId?: string;
 };
 

@@ -8,6 +8,7 @@ import type {
   CreateEventInput,
   EventCard,
   EventFormat,
+  EventSlot,
   Registration,
   RegistrationStatus,
   Role,
@@ -43,6 +44,59 @@ type AnyContext = Context<any>;
 type ReplyExtra = Parameters<AnyContext['reply']>[1];
 
 const screenMessages = new Map<string, string[]>();
+
+type EventDraft = Partial<CreateEventInput> & {
+  date?: string;
+  time?: string;
+};
+
+type FlowState =
+  | {
+      kind: 'create_event';
+      step: CreateEventStep;
+      draft: EventDraft;
+    }
+  | {
+      kind: 'edit_event';
+      step: EditEventStep;
+      eventId?: string;
+      field?: EditableEventField;
+    };
+
+type CreateEventStep =
+  | 'university'
+  | 'title'
+  | 'date'
+  | 'time'
+  | 'duration'
+  | 'format'
+  | 'capacity'
+  | 'location'
+  | 'description'
+  | 'requirements'
+  | 'cancelPolicy'
+  | 'lateCancelAllowed'
+  | 'slots'
+  | 'confirm';
+
+type EditEventStep = 'eventId' | 'field' | 'value';
+
+type EditableEventField =
+  | 'title'
+  | 'date'
+  | 'time'
+  | 'duration'
+  | 'format'
+  | 'capacity'
+  | 'location'
+  | 'description'
+  | 'requirements'
+  | 'cancelPolicy'
+  | 'registrationClosed'
+  | 'lateCancelAllowed'
+  | 'slots';
+
+const flowStates = new Map<string, FlowState>();
 
 const statusLabels: Record<RegistrationStatus, string> = {
   confirmed: 'Подтверждена',
@@ -172,10 +226,22 @@ function parseIdSet(raw?: string): Set<number> {
 
 function formatDate(iso: string): string {
   return new Intl.DateTimeFormat('ru-RU', {
-    dateStyle: 'medium',
-    timeStyle: 'short',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
     timeZone: 'Europe/Moscow'
   }).format(new Date(iso));
+}
+
+function userFlowKey(ctx: AnyContext): string | undefined {
+  const sender = getSender(ctx);
+  return sender ? `user:${sender.user_id}` : undefined;
+}
+
+async function sendNewMessage(ctx: AnyContext, text: string, extra?: ReplyExtra): Promise<void> {
+  await ctx.reply(text, extra);
 }
 
 function formatDuration(minutes: number): string {
@@ -686,14 +752,10 @@ function eventCreateHelp(universityId?: string): string {
   return [
     'Создание мероприятия',
     '',
-    'Отправьте команду в формате:',
-    '/org_create Название | 2026-06-15 15:00 | 60 | offline | 30 | Место или ссылка | Описание',
-    '',
-    'Формат: online или offline.',
-    `Вуз: ${universityId ?? 'для техадмина укажите university_id последним полем'}`,
-    '',
-    'Для техадмина:',
-    '/org_create Название | 2026-06-15 15:00 | 60 | online | 30 | Ссылка | Описание | university_id'
+    'Бот будет спрашивать поля по очереди.',
+    `Вуз: ${universityId ?? 'нужно будет указать university_id'}`,
+    'Дата вводится в формате ДД.ММ.ГГГГ, время - ЧЧ:ММ.',
+    'Слоты можно будет добавить отдельным шагом.'
   ].join('\n');
 }
 
@@ -703,11 +765,10 @@ function eventEditHelp(eventId?: string): string {
   return [
     'Изменение мероприятия',
     '',
-    'Отправьте команду:',
-    `/org_edit ${prefix} | поле | новое значение`,
+    'Бот спросит мероприятие, поле и новое значение по шагам.',
     '',
     'Поля:',
-    'title, date, duration, format, capacity, place, description, requirements, cancelPolicy, registrationClosed, lateCancelAllowed',
+    'title, date, duration, format, capacity, place, description, requirements, cancelPolicy, registrationClosed, lateCancelAllowed, slots',
     '',
     'Пример:',
     `/org_edit ${prefix} | place | Главный корпус, аудитория 305`
@@ -715,9 +776,41 @@ function eventEditHelp(eventId?: string): string {
 }
 
 function parseEventDate(raw: string): string | undefined {
-  const normalized = raw.trim().replace(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})$/, '$1T$2:00+03:00');
+  const trimmed = raw.trim();
+  const ruMatch = trimmed.match(/^(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{2}):(\d{2}))?$/);
+
+  if (ruMatch) {
+    const [, day, month, year, hour = '00', minute = '00'] = ruMatch;
+    const date = new Date(`${year}-${month}-${day}T${hour}:${minute}:00+03:00`);
+
+    if (Number.isNaN(date.getTime())) {
+      return undefined;
+    }
+
+    const parts = new Intl.DateTimeFormat('ru-RU', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'Europe/Moscow'
+    }).formatToParts(date);
+    const part = (type: string) => parts.find((item) => item.type === type)?.value;
+
+    if (part('day') !== day || part('month') !== month || part('year') !== year || part('hour') !== hour || part('minute') !== minute) {
+      return undefined;
+    }
+
+    return date.toISOString();
+  }
+
+  const normalized = trimmed.replace(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})$/, '$1T$2:00+03:00');
   const date = new Date(normalized);
   return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function parseEventDateTime(dateRaw: string, timeRaw: string): string | undefined {
+  return parseEventDate(`${dateRaw.trim()} ${timeRaw.trim()}`);
 }
 
 function parseCreateEventInput(raw: string, user: StoredUser): CreateEventInput | string {
@@ -742,7 +835,7 @@ function parseCreateEventInput(raw: string, user: StoredUser): CreateEventInput 
   const startsAt = parseEventDate(startsAtRaw);
 
   if (!startsAt) {
-    return 'Дата не распознана. Используйте формат 2026-06-15 15:00.';
+    return 'Дата не распознана. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ.';
   }
 
   const durationMinutes = Number(durationRaw);
@@ -793,7 +886,7 @@ function parseEditEventInput(raw: string): { eventId: string; patch: UpdateEvent
   const field = fieldRaw.toLowerCase();
 
   if (!eventId || !field || !value) {
-    return 'Не хватает полей. Используйте: /org_edit event_id | поле | новое значение';
+    return 'Не хватает полей. Лучше запустите пошаговый режим командой /org_edit.';
   }
 
   if (field === 'title') return { eventId, patch: { title: value }, label: 'название' };
@@ -804,7 +897,7 @@ function parseEditEventInput(raw: string): { eventId: string; patch: UpdateEvent
 
   if (field === 'date' || field === 'startsat') {
     const startsAt = parseEventDate(value);
-    return startsAt ? { eventId, patch: { startsAt }, label: 'дата и время' } : 'Дата не распознана. Используйте формат 2026-06-15 15:00.';
+    return startsAt ? { eventId, patch: { startsAt }, label: 'дата и время' } : 'Дата не распознана. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ.';
   }
 
   if (field === 'duration') {
@@ -834,6 +927,10 @@ function parseEditEventInput(raw: string): { eventId: string; patch: UpdateEvent
     return lateCancelAllowed === undefined ? 'Значение должно быть true/false или да/нет.' : { eventId, patch: { lateCancelAllowed }, label: 'поздняя отмена' };
   }
 
+  if (field === 'slots') {
+    return 'Слоты меняются только через пошаговый режим /org_edit, чтобы взять дату из выбранного мероприятия.';
+  }
+
   return `Поле "${fieldRaw}" не поддерживается.`;
 }
 
@@ -841,6 +938,243 @@ function changeNotificationKind(patch: UpdateEventInput): keyof typeof notificat
   if (patch.startsAt) return 'time';
   if (patch.locationOrUrl) return patch.locationOrUrl.startsWith('http') ? 'link' : 'room';
   return 'details';
+}
+
+function nextCreateEventStep(step: CreateEventStep): CreateEventStep {
+  const steps: CreateEventStep[] = [
+    'university',
+    'title',
+    'date',
+    'time',
+    'duration',
+    'format',
+    'capacity',
+    'location',
+    'description',
+    'requirements',
+    'cancelPolicy',
+    'lateCancelAllowed',
+    'slots',
+    'confirm'
+  ];
+  return steps[Math.min(steps.indexOf(step) + 1, steps.length - 1)];
+}
+
+function createEventPrompt(step: CreateEventStep): string {
+  const prompts: Record<CreateEventStep, string> = {
+    university: 'Введите university_id вуза, для которого создается мероприятие. Например: rtu-mirea',
+    title: 'Введите название мероприятия.',
+    date: 'Введите дату мероприятия в формате ДД.ММ.ГГГГ. Например: 15.06.2026',
+    time: 'Введите время начала в формате ЧЧ:ММ. Например: 15:00',
+    duration: 'Введите длительность в минутах. Например: 60',
+    format: 'Введите формат: online или offline.',
+    capacity: 'Введите лимит мест числом. Например: 30',
+    location: 'Введите место или ссылку.',
+    description: 'Введите описание мероприятия.',
+    requirements: 'Введите требования к участнику. Если требований нет, отправьте "-".',
+    cancelPolicy: 'Введите правила отмены. Если подходят стандартные, отправьте "-".',
+    lateCancelAllowed: 'Разрешить позднюю отмену после старта? Ответьте да или нет.',
+    slots: 'Введите слоты через запятую в формате ЧЧ:ММ-ЧЧ:ММ. Например: 15:00-16:00, 17:00-18:00. Если слоты не нужны, отправьте "-".',
+    confirm: 'Проверьте данные и отправьте "да" для создания или "нет" для отмены.'
+  };
+  return prompts[step];
+}
+
+function buildEventInputFromDraft(draft: EventDraft): CreateEventInput | string {
+  if (!draft.universityId || !draft.title || !draft.date || !draft.time || !draft.durationMinutes || !draft.format || !draft.capacity || !draft.locationOrUrl || !draft.description) {
+    return 'Черновик неполный. Начните создание заново.';
+  }
+
+  const startsAt = parseEventDateTime(draft.date, draft.time);
+
+  if (!startsAt) {
+    return 'Дата или время не распознаны. Начните создание заново.';
+  }
+
+  return {
+    universityId: draft.universityId,
+    title: draft.title,
+    startsAt,
+    durationMinutes: draft.durationMinutes,
+    format: draft.format,
+    capacity: draft.capacity,
+    locationOrUrl: draft.locationOrUrl,
+    description: draft.description,
+    requirements: draft.requirements ?? 'Подтверждение записи с кодом.',
+    cancelPolicy: draft.cancelPolicy ?? 'Отмена доступна до начала мероприятия.',
+    registrationClosed: false,
+    lateCancelAllowed: draft.lateCancelAllowed ?? false,
+    slots: draft.slots ?? []
+  };
+}
+
+function formatEventDraft(draft: EventDraft): string {
+  return [
+    `Вуз: ${draft.universityId ?? '-'}`,
+    `Название: ${draft.title ?? '-'}`,
+    `Дата: ${draft.date ?? '-'}`,
+    `Время: ${draft.time ?? '-'}`,
+    `Длительность: ${draft.durationMinutes ?? '-'} мин.`,
+    `Формат: ${draft.format ?? '-'}`,
+    `Лимит: ${draft.capacity ?? '-'}`,
+    `Место/ссылка: ${draft.locationOrUrl ?? '-'}`,
+    `Описание: ${draft.description ?? '-'}`,
+    `Требования: ${draft.requirements ?? 'стандартные'}`,
+    `Правила отмены: ${draft.cancelPolicy ?? 'стандартные'}`,
+    `Поздняя отмена: ${draft.lateCancelAllowed ? 'да' : 'нет'}`,
+    `Слоты: ${draft.slots?.length ? draft.slots.map((slot) => slot.label).join(', ') : 'без слотов'}`
+  ].join('\n');
+}
+
+function parseSlots(raw: string, dateRaw: string): EventSlot[] {
+  if (raw.trim() === '-') {
+    return [];
+  }
+
+  return raw.split(',').map((part) => part.trim()).map((label) => {
+    const match = label.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/);
+
+    if (!match) {
+      throw new Error(`Слот "${label}" должен быть в формате ЧЧ:ММ-ЧЧ:ММ.`);
+    }
+
+    const startsAt = parseEventDate(`${dateRaw} ${match[1]}:${match[2]}`);
+
+    if (!startsAt) {
+      throw new Error(`Не удалось разобрать время слота "${label}".`);
+    }
+
+    return {
+      id: label.replace(/[^0-9]+/g, '-').replace(/^-+|-+$/g, ''),
+      label,
+      startsAt
+    };
+  });
+}
+
+function editableFieldLabels(): Record<EditableEventField, string> {
+  return {
+    title: 'название',
+    date: 'дату',
+    time: 'время',
+    duration: 'длительность',
+    format: 'формат',
+    capacity: 'лимит мест',
+    location: 'место или ссылку',
+    description: 'описание',
+    requirements: 'требования',
+    cancelPolicy: 'правила отмены',
+    registrationClosed: 'статус регистрации',
+    lateCancelAllowed: 'позднюю отмену',
+    slots: 'слоты'
+  };
+}
+
+function eventFieldKeyboard(eventId: string) {
+  return rows([
+    [button('Название', `flow:edit-field:${eventId}:title`), button('Дата', `flow:edit-field:${eventId}:date`)],
+    [button('Время', `flow:edit-field:${eventId}:time`), button('Длительность', `flow:edit-field:${eventId}:duration`)],
+    [button('Формат', `flow:edit-field:${eventId}:format`), button('Лимит', `flow:edit-field:${eventId}:capacity`)],
+    [button('Место/ссылка', `flow:edit-field:${eventId}:location`)],
+    [button('Описание', `flow:edit-field:${eventId}:description`)],
+    [button('Требования', `flow:edit-field:${eventId}:requirements`)],
+    [button('Правила отмены', `flow:edit-field:${eventId}:cancelPolicy`)],
+    [button('Регистрация открыта/закрыта', `flow:edit-field:${eventId}:registrationClosed`)],
+    [button('Поздняя отмена', `flow:edit-field:${eventId}:lateCancelAllowed`)],
+    [button('Слоты', `flow:edit-field:${eventId}:slots`)],
+    [button('Отмена', 'flow:cancel')]
+  ]);
+}
+
+function editValuePrompt(field: EditableEventField): string {
+  const labels = editableFieldLabels();
+  const hints: Partial<Record<EditableEventField, string>> = {
+    date: 'Введите новую дату в формате ДД.ММ.ГГГГ. Например: 15.06.2026',
+    time: 'Введите новое время в формате ЧЧ:ММ. Например: 15:00',
+    duration: 'Введите новую длительность в минутах.',
+    format: 'Введите online или offline.',
+    capacity: 'Введите новый лимит мест числом.',
+    registrationClosed: 'Закрыть регистрацию? Ответьте да или нет.',
+    lateCancelAllowed: 'Разрешить позднюю отмену? Ответьте да или нет.',
+    slots: 'Введите слоты через запятую в формате ЧЧ:ММ-ЧЧ:ММ. Например: 15:00-16:00, 17:00-18:00. Чтобы убрать слоты, отправьте "-".'
+  };
+
+  return hints[field] ?? `Введите новое значение для поля "${labels[field]}".`;
+}
+
+function buildEditPatch(event: EventCard, field: EditableEventField, raw: string): { patch: UpdateEventInput; label: string } | string {
+  const value = raw.trim();
+  const labels = editableFieldLabels();
+
+  if (!value) {
+    return 'Значение не должно быть пустым.';
+  }
+
+  switch (field) {
+    case 'title':
+      return { patch: { title: value }, label: labels[field] };
+    case 'description':
+      return { patch: { description: value }, label: labels[field] };
+    case 'requirements':
+      return { patch: { requirements: value === '-' ? 'Подтверждение записи с кодом.' : value }, label: labels[field] };
+    case 'cancelPolicy':
+      return { patch: { cancelPolicy: value === '-' ? 'Отмена доступна до начала мероприятия.' : value }, label: labels[field] };
+    case 'location':
+      return { patch: { locationOrUrl: value }, label: labels[field] };
+    case 'date': {
+      const currentTime = new Intl.DateTimeFormat('ru-RU', {
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'Europe/Moscow'
+      }).format(new Date(event.startsAt));
+      const startsAt = parseEventDateTime(value, currentTime);
+      return startsAt ? { patch: { startsAt }, label: labels[field] } : 'Дата не распознана. Используйте ДД.ММ.ГГГГ.';
+    }
+    case 'time': {
+      const currentDate = new Intl.DateTimeFormat('ru-RU', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        timeZone: 'Europe/Moscow'
+      }).format(new Date(event.startsAt));
+      const startsAt = parseEventDateTime(currentDate, value);
+      return startsAt ? { patch: { startsAt }, label: labels[field] } : 'Время не распознано. Используйте ЧЧ:ММ.';
+    }
+    case 'duration': {
+      const durationMinutes = Number(value);
+      return Number.isInteger(durationMinutes) && durationMinutes > 0 ? { patch: { durationMinutes }, label: labels[field] } : 'Длительность должна быть целым числом больше нуля.';
+    }
+    case 'format': {
+      const format = value.toLowerCase() as EventFormat;
+      return format === 'online' || format === 'offline' ? { patch: { format }, label: labels[field] } : 'Формат должен быть online или offline.';
+    }
+    case 'capacity': {
+      const capacity = Number(value);
+      return Number.isInteger(capacity) && capacity > 0 ? { patch: { capacity }, label: labels[field] } : 'Лимит должен быть целым числом больше нуля.';
+    }
+    case 'registrationClosed': {
+      const answer = parseBoolean(value);
+      return answer === undefined ? 'Ответьте да или нет.' : { patch: { registrationClosed: answer }, label: labels[field] };
+    }
+    case 'lateCancelAllowed': {
+      const answer = parseBoolean(value);
+      return answer === undefined ? 'Ответьте да или нет.' : { patch: { lateCancelAllowed: answer }, label: labels[field] };
+    }
+    case 'slots': {
+      const currentDate = new Intl.DateTimeFormat('ru-RU', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        timeZone: 'Europe/Moscow'
+      }).format(new Date(event.startsAt));
+
+      try {
+        return { patch: { slots: parseSlots(value, currentDate) }, label: labels[field] };
+      } catch (error) {
+        return error instanceof Error ? error.message : 'Не удалось разобрать слоты.';
+      }
+    }
+  }
 }
 
 async function showOrganizerMenu(ctx: AnyContext) {
@@ -864,7 +1198,7 @@ async function showOrganizerMenu(ctx: AnyContext) {
 
   await renderSingle(
     ctx,
-    ['Ваши мероприятия:', '', canCreateEvent(user) ? 'Создать новое можно командой /org_create. Изменить можно командой /org_edit.' : 'Доступные действия откроются в карточке мероприятия.'].join('\n'),
+    ['Ваши мероприятия:', '', canCreateEvent(user) ? 'Создание и изменение проходят пошагово через /org_create и /org_edit.' : 'Доступные действия откроются в карточке мероприятия.'].join('\n'),
     rows([
       ...(canCreateEvent(user) ? [[button('Создать мероприятие', 'org:create')]] : []),
       ...manageable.map((event) => [button(`${event.deletedAt ? '[Удалено] ' : ''}${event.title}`, `org:event:${event.id}`)]),
@@ -881,7 +1215,7 @@ async function showCreateEventHelp(ctx: AnyContext) {
     return;
   }
 
-  await renderSingle(ctx, eventCreateHelp(user.universityId), rows([[button('Назад', 'org')]]));
+  await startCreateEventFlow(ctx, user);
 }
 
 async function createEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
@@ -889,6 +1223,11 @@ async function createEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
 
   if (!user || !canCreateEvent(user)) {
     await renderSingle(ctx, 'Создание мероприятий доступно только организатору, админу своего вуза или техадмину.', rows([[button('Главное меню', 'menu')]]));
+    return;
+  }
+
+  if (!raw) {
+    await startCreateEventFlow(ctx, user);
     return;
   }
 
@@ -909,6 +1248,170 @@ async function createEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
   const event = await store.createEvent(input);
   logger.info({ eventId: event.id, userId: user.id, universityId: event.universityId }, 'event created by organizer');
   await renderSingle(ctx, `Мероприятие создано:\n${formatEvent(event, event.capacity, university)}`, rows([[button('Открыть', `org:event:${event.id}`)], [button('Назад', 'org')]]));
+}
+
+async function startCreateEventFlow(ctx: AnyContext, user: StoredUser): Promise<void> {
+  const key = userFlowKey(ctx);
+
+  if (!key) {
+    await sendNewMessage(ctx, 'Не удалось определить пользователя.');
+    return;
+  }
+
+  const step: CreateEventStep = user.role === 'tech_admin' ? 'university' : 'title';
+  const draft: EventDraft = user.role === 'tech_admin' ? {} : { universityId: user.universityId };
+
+  if (!draft.universityId && user.role !== 'tech_admin') {
+    await sendNewMessage(ctx, 'У вас не указан вуз. Обратитесь к техадмину.');
+    return;
+  }
+
+  flowStates.set(key, { kind: 'create_event', step, draft });
+  await sendNewMessage(ctx, [eventCreateHelp(draft.universityId), '', createEventPrompt(step)].join('\n'), rows([[button('Отмена', 'flow:cancel')]]));
+}
+
+async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, { kind: 'create_event' }>, text: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const user = await requireConsent(ctx);
+
+  if (!key || !user || !canCreateEvent(user)) {
+    return;
+  }
+
+  const value = text.trim();
+  const draft = { ...state.draft };
+
+  try {
+    switch (state.step) {
+      case 'university': {
+        const university = await store.getUniversity(value);
+        if (!university) {
+          await sendNewMessage(ctx, 'Вуз не найден. Введите существующий university_id.');
+          return;
+        }
+        draft.universityId = value;
+        break;
+      }
+      case 'title':
+        draft.title = value;
+        break;
+      case 'date':
+        if (!parseEventDate(value)) {
+          await sendNewMessage(ctx, 'Дата не распознана. Введите дату в формате ДД.ММ.ГГГГ, например 15.06.2026.');
+          return;
+        }
+        draft.date = value;
+        break;
+      case 'time':
+        if (!/^\d{2}:\d{2}$/.test(value) || !draft.date || !parseEventDateTime(draft.date, value)) {
+          await sendNewMessage(ctx, 'Время не распознано. Введите в формате ЧЧ:ММ, например 15:00.');
+          return;
+        }
+        draft.time = value;
+        break;
+      case 'duration': {
+        const durationMinutes = Number(value);
+        if (!Number.isInteger(durationMinutes) || durationMinutes <= 0) {
+          await sendNewMessage(ctx, 'Длительность должна быть целым числом минут больше нуля.');
+          return;
+        }
+        draft.durationMinutes = durationMinutes;
+        break;
+      }
+      case 'format': {
+        const format = value.toLowerCase() as EventFormat;
+        if (format !== 'online' && format !== 'offline') {
+          await sendNewMessage(ctx, 'Введите online или offline.');
+          return;
+        }
+        draft.format = format;
+        break;
+      }
+      case 'capacity': {
+        const capacity = Number(value);
+        if (!Number.isInteger(capacity) || capacity <= 0) {
+          await sendNewMessage(ctx, 'Лимит мест должен быть целым числом больше нуля.');
+          return;
+        }
+        draft.capacity = capacity;
+        break;
+      }
+      case 'location':
+        draft.locationOrUrl = value;
+        break;
+      case 'description':
+        draft.description = value;
+        break;
+      case 'requirements':
+        draft.requirements = value === '-' ? 'Подтверждение записи с кодом.' : value;
+        break;
+      case 'cancelPolicy':
+        draft.cancelPolicy = value === '-' ? 'Отмена доступна до начала мероприятия.' : value;
+        break;
+      case 'lateCancelAllowed': {
+        const lateCancelAllowed = parseBoolean(value);
+        if (lateCancelAllowed === undefined) {
+          await sendNewMessage(ctx, 'Ответьте да или нет.');
+          return;
+        }
+        draft.lateCancelAllowed = lateCancelAllowed;
+        break;
+      }
+      case 'slots': {
+        if (!draft.date) {
+          await sendNewMessage(ctx, 'Дата потерялась. Начните создание заново.');
+          flowStates.delete(key);
+          return;
+        }
+        try {
+          const slots = parseSlots(value, draft.date);
+          draft.slots = slots;
+        } catch (error) {
+          await sendNewMessage(ctx, error instanceof Error ? error.message : 'Не удалось разобрать слоты.');
+          return;
+        }
+        break;
+      }
+      case 'confirm': {
+        const accepted = parseBoolean(value);
+        if (accepted === false) {
+          flowStates.delete(key);
+          await sendNewMessage(ctx, 'Создание отменено.', rows([[button('Назад', 'org')]]));
+          return;
+        }
+        if (accepted !== true) {
+          await sendNewMessage(ctx, 'Отправьте "да" для создания или "нет" для отмены.');
+          return;
+        }
+        const input = buildEventInputFromDraft(draft);
+        if (typeof input === 'string') {
+          flowStates.delete(key);
+          await sendNewMessage(ctx, input, rows([[button('Создать заново', 'org:create')], [button('Назад', 'org')]]));
+          return;
+        }
+        const university = await store.getUniversity(input.universityId);
+        const event = await store.createEvent(input);
+        flowStates.delete(key);
+        logger.info({ eventId: event.id, userId: user.id, universityId: event.universityId }, 'event created by flow');
+        await sendNewMessage(ctx, `Мероприятие создано:\n${formatEvent(event, event.capacity, university)}`, rows([[button('Открыть', `org:event:${event.id}`)], [button('Назад', 'org')]]));
+        return;
+      }
+    }
+  } catch (error) {
+    logger.error({ err: error, userId: user.id }, 'create event flow failed');
+    await sendNewMessage(ctx, 'Не удалось обработать ответ. Попробуйте ещё раз или отмените создание.', rows([[button('Отмена', 'flow:cancel')]]));
+    return;
+  }
+
+  const nextStep = nextCreateEventStep(state.step);
+  flowStates.set(key, { kind: 'create_event', step: nextStep, draft });
+
+  if (nextStep === 'confirm') {
+    await sendNewMessage(ctx, ['Проверьте мероприятие:', '', formatEventDraft(draft), '', createEventPrompt(nextStep)].join('\n'), rows([[button('Отмена', 'flow:cancel')]]));
+    return;
+  }
+
+  await sendNewMessage(ctx, createEventPrompt(nextStep), rows([[button('Отмена', 'flow:cancel')]]));
 }
 
 async function showOrganizerEvent(ctx: AnyContext, eventId: string) {
@@ -959,7 +1462,7 @@ async function showEditEventHelp(ctx: AnyContext, eventId: string) {
     return;
   }
 
-  await renderSingle(ctx, eventEditHelp(event.id), rows([[button('Назад', `org:event:${event.id}`)]]));
+  await startEditEventFlow(ctx, event);
 }
 
 async function updateEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
@@ -998,6 +1501,131 @@ async function updateEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
   const notified = await sendAutomaticEventChangeNotification(updated, changeNotificationKind(parsed.patch), parsed.label);
   logger.info({ eventId: updated.id, userId: user.id, universityId: updated.universityId, notified }, 'event updated by organizer');
   await renderSingle(ctx, `Мероприятие изменено: ${parsed.label}.\nУведомлений отправлено: ${notified}.`, rows([[button('Открыть', `org:event:${updated.id}`)], [button('Назад', 'org')]]));
+}
+
+async function startEditEventFlow(ctx: AnyContext, event?: EventCard): Promise<void> {
+  const key = userFlowKey(ctx);
+  const user = await requireConsent(ctx);
+
+  if (!key || !user) {
+    return;
+  }
+
+  if (event && !canEditEvent(user, event)) {
+    await sendNewMessage(ctx, 'Нет доступа к изменению этого мероприятия.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  if (event?.deletedAt) {
+    await sendNewMessage(ctx, 'Удаленное мероприятие сначала нужно восстановить.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    return;
+  }
+
+  if (event) {
+    flowStates.set(key, { kind: 'edit_event', step: 'field', eventId: event.id });
+    await sendNewMessage(ctx, `Что изменить в мероприятии "${event.title}"?`, eventFieldKeyboard(event.id));
+    return;
+  }
+
+  flowStates.set(key, { kind: 'edit_event', step: 'eventId' });
+  await sendNewMessage(ctx, 'Введите id мероприятия, которое нужно изменить.', rows([[button('Отмена', 'flow:cancel')]]));
+}
+
+async function selectEditField(ctx: AnyContext, eventId: string, field: EditableEventField): Promise<void> {
+  const key = userFlowKey(ctx);
+  const user = await requireConsent(ctx);
+  const event = await eventById(eventId);
+
+  if (!key || !user || !event || !canEditEvent(user, event)) {
+    await sendNewMessage(ctx, 'Мероприятие не найдено или нет доступа.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  flowStates.set(key, { kind: 'edit_event', step: 'value', eventId, field });
+  await sendNewMessage(ctx, editValuePrompt(field), rows([[button('Отмена', 'flow:cancel')]]));
+}
+
+async function handleEditEventFlow(ctx: AnyContext, state: Extract<FlowState, { kind: 'edit_event' }>, text: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const user = await requireConsent(ctx);
+
+  if (!key || !user) {
+    return;
+  }
+
+  if (state.step === 'eventId') {
+    const event = await eventById(text.trim());
+
+    if (!event || !canEditEvent(user, event)) {
+      await sendNewMessage(ctx, 'Мероприятие не найдено или нет доступа. Введите другой id или отмените действие.', rows([[button('Отмена', 'flow:cancel')]]));
+      return;
+    }
+
+    if (event.deletedAt) {
+      await sendNewMessage(ctx, 'Удаленное мероприятие сначала нужно восстановить.', rows([[button('Назад', `org:event:${event.id}`)], [button('Отмена', 'flow:cancel')]]));
+      return;
+    }
+
+    flowStates.set(key, { kind: 'edit_event', step: 'field', eventId: event.id });
+    await sendNewMessage(ctx, `Что изменить в мероприятии "${event.title}"?`, eventFieldKeyboard(event.id));
+    return;
+  }
+
+  if (state.step === 'field') {
+    await sendNewMessage(ctx, 'Выберите поле кнопкой ниже.', state.eventId ? eventFieldKeyboard(state.eventId) : rows([[button('Отмена', 'flow:cancel')]]));
+    return;
+  }
+
+  if (!state.eventId || !state.field) {
+    flowStates.delete(key);
+    await sendNewMessage(ctx, 'Сценарий изменения сброшен. Начните заново.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const event = await eventById(state.eventId);
+
+  if (!event || !canEditEvent(user, event)) {
+    flowStates.delete(key);
+    await sendNewMessage(ctx, 'Мероприятие не найдено или нет доступа.', rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const parsed = buildEditPatch(event, state.field, text);
+
+  if (typeof parsed === 'string') {
+    await sendNewMessage(ctx, parsed, rows([[button('Отмена', 'flow:cancel')]]));
+    return;
+  }
+
+  const updated = await store.updateEvent(event.id, parsed.patch);
+
+  if (!updated) {
+    flowStates.delete(key);
+    await sendNewMessage(ctx, 'Не удалось изменить мероприятие.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    return;
+  }
+
+  const notified = await sendAutomaticEventChangeNotification(updated, changeNotificationKind(parsed.patch), parsed.label);
+  flowStates.delete(key);
+  logger.info({ eventId: updated.id, userId: user.id, universityId: updated.universityId, notified }, 'event updated by flow');
+  await sendNewMessage(ctx, `Мероприятие изменено: ${parsed.label}.\nУведомлений поставлено в очередь: ${notified}.`, rows([[button('Открыть', `org:event:${updated.id}`)], [button('Назад', 'org')]]));
+}
+
+async function handleFlowMessage(ctx: AnyContext, text: string): Promise<boolean> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state) {
+    return false;
+  }
+
+  if (state.kind === 'create_event') {
+    await handleCreateEventFlow(ctx, state, text);
+    return true;
+  }
+
+  await handleEditEventFlow(ctx, state, text);
+  return true;
 }
 
 async function confirmDeleteOrganizerEvent(ctx: AnyContext, eventId: string) {
@@ -1421,21 +2049,25 @@ async function answerCallback(ctx: AnyContext) {
   }
 }
 
-await bot.api.setMyCommands([
-  { name: 'start', description: 'Главное меню' },
-  { name: 'events', description: 'Каталог мероприятий' },
-  { name: 'my', description: 'Мои записи' },
-  { name: 'org', description: 'Меню организатора' },
-  { name: 'org_create', description: 'Создать мероприятие' },
-  { name: 'org_edit', description: 'Изменить мероприятие' },
-  { name: 'admin', description: 'Админ-панель' },
-  { name: 'admin_add', description: 'Назначить админа по MAX ID' },
-  { name: 'admin_org', description: 'Назначить организатора по MAX ID' },
-  { name: 'admin_remove', description: 'Снять права по MAX ID' },
-  { name: 'admin_university', description: 'Сменить вуз админа или организатора' },
-  { name: 'find', description: 'Найти запись по коду' },
-  { name: 'whoami', description: 'Показать ваш MAX ID' }
-]);
+try {
+  await bot.api.setMyCommands([
+    { name: 'start', description: 'Главное меню' },
+    { name: 'events', description: 'Каталог мероприятий' },
+    { name: 'my', description: 'Мои записи' },
+    { name: 'org', description: 'Меню организатора' },
+    { name: 'org_create', description: 'Создать мероприятие' },
+    { name: 'org_edit', description: 'Изменить мероприятие' },
+    { name: 'admin', description: 'Админ-панель' },
+    { name: 'admin_add', description: 'Назначить админа по MAX ID' },
+    { name: 'admin_org', description: 'Назначить организатора по MAX ID' },
+    { name: 'admin_remove', description: 'Снять права по MAX ID' },
+    { name: 'admin_university', description: 'Сменить вуз админа или организатора' },
+    { name: 'find', description: 'Найти запись по коду' },
+    { name: 'whoami', description: 'Показать ваш MAX ID' }
+  ]);
+} catch (error) {
+  logger.warn({ err: error }, 'failed to set bot commands');
+}
 
 bot.on('bot_started', async (ctx) => {
   logger.info(logContext(ctx), 'bot started conversation');
@@ -1461,25 +2093,13 @@ bot.command('org', async (ctx) => {
 });
 bot.command('org_create', async (ctx) => {
   logger.info(logContext(ctx), 'command org_create');
-  const raw = ctx.message.body.text?.replace(/^\/org_create(?:@\S+)?\s*/i, '').trim() ?? '';
-
-  if (raw) {
-    await createEventFromOrganizerCommand(ctx, raw);
-    return;
-  }
-
+  await answerCallback(ctx);
   await showCreateEventHelp(ctx);
 });
 bot.command('org_edit', async (ctx) => {
   logger.info(logContext(ctx), 'command org_edit');
-  const raw = ctx.message.body.text?.replace(/^\/org_edit(?:@\S+)?\s*/i, '').trim() ?? '';
-
-  if (raw) {
-    await updateEventFromOrganizerCommand(ctx, raw);
-    return;
-  }
-
-  await renderSingle(ctx, eventEditHelp(), rows([[button('Назад', 'org')]]));
+  await answerCallback(ctx);
+  await startEditEventFlow(ctx);
 });
 bot.command('admin', async (ctx) => {
   logger.info(logContext(ctx), 'command admin');
@@ -1562,6 +2182,14 @@ bot.action(/.*/, async (ctx) => {
   if (payload === 'universities') return showUniversities(ctx);
   if (payload === 'my') return showMyRegistrations(ctx);
   if (payload === 'org') return showOrganizerMenu(ctx);
+  if (scope === 'flow' && a === 'cancel') {
+    const key = userFlowKey(ctx);
+    if (key) {
+      flowStates.delete(key);
+    }
+    return sendNewMessage(ctx, 'Действие отменено.', rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+  }
+  if (scope === 'flow' && a === 'edit-field') return selectEditField(ctx, b, c as EditableEventField);
   if (scope === 'org' && a === 'create') return showCreateEventHelp(ctx);
   if (payload === 'admin') return showAdminPanel(ctx);
   if (scope === 'event') return showEventDetails(ctx, a);
@@ -1597,6 +2225,10 @@ bot.on('message_created', async (ctx) => {
   }
 
   logger.info(logContext(ctx), 'plain message received');
+  if (await handleFlowMessage(ctx, text)) {
+    return;
+  }
+
   await showMainMenu(ctx);
 });
 

@@ -200,6 +200,20 @@ export class DatabaseStore {
       ]
     );
 
+    if (patch.slots) {
+      await this.pool.query('DELETE FROM event_slots WHERE event_id = $1', [eventId]);
+
+      for (const slot of patch.slots) {
+        await this.pool.query(
+          [
+            'INSERT INTO event_slots (event_id, id, label, starts_at)',
+            'VALUES ($1, $2, $3, $4)'
+          ].join(' '),
+          [eventId, slot.id, slot.label, slot.startsAt]
+        );
+      }
+    }
+
     return this.getEvent(eventId);
   }
 
@@ -462,8 +476,19 @@ export class DatabaseStore {
 
       CREATE TABLE IF NOT EXISTS events (
         id TEXT PRIMARY KEY,
-        university_id TEXT,
-        starts_at TIMESTAMPTZ NOT NULL
+        university_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        starts_at TIMESTAMPTZ NOT NULL,
+        duration_minutes INTEGER NOT NULL,
+        format TEXT NOT NULL,
+        capacity INTEGER NOT NULL,
+        description TEXT NOT NULL,
+        requirements TEXT NOT NULL,
+        location_or_url TEXT NOT NULL,
+        cancel_policy TEXT NOT NULL,
+        registration_closed BOOLEAN NOT NULL,
+        late_cancel_allowed BOOLEAN NOT NULL,
+        deleted_at TIMESTAMPTZ
       );
 
       CREATE TABLE IF NOT EXISTS event_slots (
@@ -504,7 +529,6 @@ export class DatabaseStore {
       ALTER TABLE events ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     `);
 
-    await this.migrateLegacyEventJson();
     await this.pool.query('ALTER TABLE events DROP COLUMN IF EXISTS data_json');
     await this.fillEventDefaults();
 
@@ -528,41 +552,6 @@ export class DatabaseStore {
       CREATE INDEX IF NOT EXISTS users_university_id_idx ON users(university_id);
       CREATE INDEX IF NOT EXISTS registrations_event_id_idx ON registrations(event_id);
       CREATE INDEX IF NOT EXISTS registrations_user_id_idx ON registrations(user_id);
-    `);
-  }
-
-  private async migrateLegacyEventJson(): Promise<void> {
-    const hasDataJson = await this.hasColumn('events', 'data_json');
-
-    if (!hasDataJson) {
-      return;
-    }
-
-    await this.pool.query(`
-      UPDATE events
-      SET
-        university_id = COALESCE(university_id, data_json->>'universityId', 'rtu-mirea'),
-        title = COALESCE(title, data_json->>'title', id),
-        duration_minutes = COALESCE(duration_minutes, (data_json->>'durationMinutes')::INTEGER, 60),
-        format = COALESCE(format, data_json->>'format', 'offline'),
-        capacity = COALESCE(capacity, (data_json->>'capacity')::INTEGER, 1),
-        description = COALESCE(description, data_json->>'description', ''),
-        requirements = COALESCE(requirements, data_json->>'requirements', ''),
-        location_or_url = COALESCE(location_or_url, data_json->>'locationOrUrl', ''),
-        cancel_policy = COALESCE(cancel_policy, data_json->>'cancelPolicy', ''),
-        registration_closed = COALESCE(registration_closed, (data_json->>'registrationClosed')::BOOLEAN, FALSE),
-        late_cancel_allowed = COALESCE(late_cancel_allowed, (data_json->>'lateCancelAllowed')::BOOLEAN, FALSE)
-      WHERE data_json IS NOT NULL;
-    `);
-
-    await this.pool.query(`
-      INSERT INTO event_slots (event_id, id, label, starts_at)
-      SELECT events.id, slot->>'id', slot->>'label', (slot->>'startsAt')::TIMESTAMPTZ
-      FROM events
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(events.data_json->'slots', '[]'::jsonb)) AS slot
-      ON CONFLICT(event_id, id) DO UPDATE SET
-        label = EXCLUDED.label,
-        starts_at = EXCLUDED.starts_at;
     `);
   }
 
