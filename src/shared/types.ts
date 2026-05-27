@@ -57,6 +57,16 @@ export type UpdateEventInput = Partial<Omit<CreateEventInput, 'universityId' | '
 
 export type DeleteEventResult = 'deleted' | 'not_found';
 
+export type NotificationJobInput = {
+  recipients: number[];
+  text: string;
+};
+
+export type NotificationJobResult = {
+  jobId: string;
+  recipients: number;
+};
+
 export type RegistrationStatus =
   | 'confirmed'
   | 'attended'

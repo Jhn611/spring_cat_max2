@@ -1,5 +1,8 @@
 import pg from 'pg';
+import { sql } from 'drizzle-orm';
+import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { isActiveStatus } from '../shared/domain.js';
+import * as schema from './schema.js';
 import type {
   CreateEventInput,
   DeleteEventResult,
@@ -71,12 +74,15 @@ type DbUniversityRow = {
 
 export class DatabaseStore {
   private readonly pool: pg.Pool;
+  private readonly db: NodePgDatabase<typeof schema>;
 
   constructor(connectionString: string) {
     this.pool = new Pool({ connectionString });
+    this.db = drizzle(this.pool, { schema });
   }
 
   async init(): Promise<void> {
+    await this.db.execute(sql`SELECT 1`);
     await this.migrate();
   }
 

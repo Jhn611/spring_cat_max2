@@ -16,6 +16,19 @@ services:
       retries: 5
       start_period: 5s
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - springcat-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   data-service:
     image: springcat-app:latest
     build:
@@ -41,6 +54,60 @@ services:
       retries: 5
       start_period: 5s
 
+  task-service:
+    image: springcat-app:latest
+    build:
+      context: .
+    command: ["node", "dist/task-service/index.js"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TASK_SERVICE_PORT: "3070"
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "3070:3070"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:3070/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  api-gateway:
+    image: springcat-app:latest
+    command: ["node", "dist/api-gateway/index.js"]
+    environment:
+      API_GATEWAY_PORT: "3050"
+      DATA_SERVICE_URL: http://data-service:3060
+      TASK_SERVICE_URL: http://task-service:3070
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "3050:3050"
+    depends_on:
+      data-service:
+        condition: service_healthy
+      task-service:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:3050/health').then(r => r.json()).then(j => process.exit(j.ok ? 0 : 1)).catch(() => process.exit(1))\""
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   bot:
     image: springcat-app:latest
     command: ["node", "dist/bot/index.js"]
@@ -48,12 +115,13 @@ services:
       - path: .env
         required: false
     environment:
-      DATA_SERVICE_URL: http://data-service:3060
+      API_GATEWAY_URL: http://api-gateway:3050
       LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
-      data-service:
+      api-gateway:
         condition: service_healthy
     restart: unless-stopped
 
 volumes:
   springcat-postgres:
+  springcat-redis:

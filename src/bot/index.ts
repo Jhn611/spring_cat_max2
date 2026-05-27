@@ -23,7 +23,7 @@ if (!token) {
 }
 
 const bot = new Bot(token);
-const store = new DataServiceClient(process.env.DATA_SERVICE_URL ?? 'http://localhost:3060');
+const store = new DataServiceClient(process.env.API_GATEWAY_URL ?? process.env.DATA_SERVICE_URL ?? 'http://localhost:3050');
 const legalDocVersion = process.env.LEGAL_DOC_VERSION ?? 'hackathon-2026-05-14';
 const adminIds = parseIdSet(process.env.ADMIN_MAX_IDS);
 const techAdminIds = parseIdSet(process.env.TECH_ADMIN_MAX_IDS ?? process.env.MAIN_ADMIN_MAX_IDS);
@@ -31,7 +31,7 @@ const bootstrapAdminUniversityId = process.env.ADMIN_UNIVERSITY_ID ?? process.en
 
 logger.info(
   {
-    dataServiceUrl: process.env.DATA_SERVICE_URL ?? 'http://localhost:3060',
+    apiGatewayUrl: process.env.API_GATEWAY_URL ?? process.env.DATA_SERVICE_URL ?? 'http://localhost:3050',
     legalDocVersion,
     adminIdsCount: adminIds.size,
     techAdminIdsCount: techAdminIds.size
@@ -1166,14 +1166,14 @@ async function sendEventNotification(ctx: AnyContext, eventId: string, kind: key
     (item) => isActiveStatus(item.status) && item.notificationsEnabled
   );
 
-  for (const recipient of recipients) {
-    await bot.api.sendMessageToUser(
-      recipient.userId,
-      [`Уведомление по мероприятию "${event.title}"`, notificationTemplates[kind]].join('\n')
-    );
+  if (recipients.length > 0) {
+    await store.enqueueNotification({
+      recipients: recipients.map((recipient) => recipient.userId),
+      text: [`Уведомление по мероприятию "${event.title}"`, notificationTemplates[kind]].join('\n')
+    });
   }
 
-  await renderSingle(ctx, `Уведомление отправлено. Получателей: ${recipients.length}.`, rows([[button('Назад', `org:event:${event.id}`)]]));
+  await renderSingle(ctx, `Уведомление поставлено в очередь. Получателей: ${recipients.length}.`, rows([[button('Назад', `org:event:${event.id}`)]]));
 }
 
 async function sendAutomaticEventChangeNotification(
@@ -1185,17 +1185,17 @@ async function sendAutomaticEventChangeNotification(
     (item) => isActiveStatus(item.status) && item.notificationsEnabled
   );
 
-  for (const recipient of recipients) {
-    await bot.api.sendMessageToUser(
-      recipient.userId,
-      [
+  if (recipients.length > 0) {
+    await store.enqueueNotification({
+      recipients: recipients.map((recipient) => recipient.userId),
+      text: [
         `Изменение по мероприятию "${event.title}"`,
         notificationTemplates[kind],
         `Изменено: ${changedLabel}`,
         `Дата: ${formatDate(event.startsAt)}`,
         `Адрес/ссылка: ${event.locationOrUrl}`
       ].join('\n')
-    );
+    });
   }
 
   return recipients.length;

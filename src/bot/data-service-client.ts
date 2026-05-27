@@ -1,4 +1,14 @@
-import type { CreateEventInput, EventCard, Registration, Role, StoredUser, UpdateEventInput, University } from '../shared/types.js';
+import type {
+  CreateEventInput,
+  EventCard,
+  NotificationJobInput,
+  NotificationJobResult,
+  Registration,
+  Role,
+  StoredUser,
+  UpdateEventInput,
+  University
+} from '../shared/types.js';
 
 export class DataServiceClient {
   constructor(private readonly baseUrl: string) {}
@@ -97,6 +107,10 @@ export class DataServiceClient {
 
   activeRegistration(userId: number, eventId: string): Promise<Registration | undefined> {
     return this.requestOrUndefined(`/registrations/active?userId=${userId}&eventId=${encodeURIComponent(eventId)}`);
+  }
+
+  enqueueNotification(input: NotificationJobInput): Promise<NotificationJobResult> {
+    return this.request('/tasks/notifications', { method: 'POST', body: input });
   }
 
   private async requestOrUndefined<T>(path: string, options: RequestOptions = {}): Promise<T | undefined> {

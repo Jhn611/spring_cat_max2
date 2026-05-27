@@ -7,6 +7,10 @@
     "dev": "tsx watch src/bot/index.ts",
     "dev:bot": "tsx watch src/bot/index.ts",
     "dev:service": "tsx watch src/data-service/index.ts",
+    "dev:gateway": "tsx watch src/api-gateway/index.ts",
+    "dev:tasks": "tsx watch src/task-service/index.ts",
+    "start:gateway": "node dist/api-gateway/index.js",
+    "start:tasks": "node dist/task-service/index.js",
     "start:service": "node dist/data-service/index.js",
     "start": "node dist/bot/index.js",
     "start:bot": "node dist/bot/index.js",
@@ -16,8 +20,11 @@
   },
   "dependencies": {
     "@maxhub/max-bot-api": "^0.2.0",
+    "bullmq": "^5.77.6",
     "dotenv": "^16.4.7",
+    "drizzle-orm": "^0.45.2",
     "fastify": "^5.8.5",
+    "ioredis": "^5.11.0",
     "pg": "^8.21.0",
     "pino": "^10.3.1"
   },
