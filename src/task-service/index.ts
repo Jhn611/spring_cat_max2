@@ -17,14 +17,25 @@ const app = Fastify({
   logger: {
     level: process.env.LOG_LEVEL ?? 'info',
     base: {
-      service: 'task-service'
+      service: 'task-service',
+      log_type: 'technical'
     }
   }
 });
 
+function businessLog(event: string, fields: Record<string, unknown>): Record<string, unknown> {
+  return {
+    log_type: 'business',
+    event,
+    ...fields
+  };
+}
+
 const worker = new Worker<NotificationJobInput>(
   'notifications',
   async (job) => {
+    // Уведомления отправляются вне обработчика бота: массовая рассылка не блокирует
+    // диалог пользователя, а BullMQ сам повторит задачу при временных сбоях.
     if (!bot) {
       throw new Error('MAX_BOT_TOKEN is required for notification jobs');
     }
@@ -42,7 +53,7 @@ const worker = new Worker<NotificationJobInput>(
 );
 
 worker.on('completed', (job, result) => {
-  app.log.info({ jobId: job.id, result }, 'notification job completed');
+  app.log.info(businessLog('notification_sent', { job_id: job.id, result }), 'notification job completed');
 });
 
 worker.on('failed', (job, error) => {
@@ -84,7 +95,7 @@ app.post<{ Body: NotificationJobInput }>('/notifications', async (request, reply
     }
   );
 
-  app.log.info({ jobId: job.id, recipients: recipients.length }, 'notification job enqueued');
+  app.log.info(businessLog('notification_enqueued', { job_id: job.id, recipients: recipients.length }), 'notification job enqueued');
   return reply.status(202).send({ jobId: String(job.id), recipients: recipients.length });
 });
 

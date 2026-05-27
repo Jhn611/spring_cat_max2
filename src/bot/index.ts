@@ -44,7 +44,23 @@ type AnyContext = Context<any>;
 type ReplyExtra = Parameters<AnyContext['reply']>[1];
 
 const screenMessages = new Map<string, string[]>();
+const pageSize = 3;
 
+const ui = {
+  ok: '✅',
+  error: '❌',
+  warn: '⚠️',
+  cancel: '🚫',
+  info: 'ℹ️',
+  search: '🔎',
+  calendar: '📅',
+  time: '🕒',
+  list: '📋',
+  admin: '🛠️'
+} as const;
+
+// In-memory сценарии нужны для пошаговых действий в MAX: создание и изменение
+// мероприятия занимают несколько сообщений, поэтому бот помнит, какой ответ ждёт.
 type EventDraft = Partial<CreateEventInput> & {
   date?: string;
   time?: string;
@@ -61,13 +77,13 @@ type FlowState =
       step: EditEventStep;
       eventId?: string;
       field?: EditableEventField;
+      draftSlots?: EventSlot[];
     };
 
 type CreateEventStep =
   | 'university'
   | 'title'
   | 'date'
-  | 'time'
   | 'duration'
   | 'format'
   | 'capacity'
@@ -106,6 +122,14 @@ const statusLabels: Record<RegistrationStatus, string> = {
   late_cancelled: 'Поздняя отмена'
 };
 
+function businessLog(event: string, fields: Record<string, unknown>): Record<string, unknown> {
+  return {
+    log_type: 'business',
+    event,
+    ...fields
+  };
+}
+
 const roleLabels: Record<Role, string> = {
   applicant: 'Абитуриент',
   organizer: 'Организатор',
@@ -114,12 +138,12 @@ const roleLabels: Record<Role, string> = {
 };
 
 const notificationTemplates = {
-  day: 'Напоминание: мероприятие состоится завтра. Проверьте код записи и детали в боте.',
-  hour: 'Напоминание: мероприятие начнется примерно через час.',
-  time: 'Обновление по мероприятию: время изменилось. Проверьте актуальную информацию у организатора.',
-  room: 'Обновление по мероприятию: изменилась аудитория или место сбора.',
-  link: 'Обновление по мероприятию: ссылка на подключение будет отправлена организатором отдельно.',
-  details: 'Обновление по мероприятию: изменились детали мероприятия. Проверьте актуальную информацию в боте.'
+  day: 'ℹ️ Напоминание: мероприятие состоится завтра. Проверьте код записи и детали в боте.',
+  hour: 'ℹ️ Напоминание: мероприятие начнётся примерно через час.',
+  time: '⚠️ Обновление по мероприятию: время изменилось. Проверьте актуальную информацию у организатора.',
+  room: '⚠️ Обновление по мероприятию: изменилась аудитория или место сбора.',
+  link: '⚠️ Обновление по мероприятию: ссылка на подключение будет отправлена организатором отдельно.',
+  details: '⚠️ Обновление по мероприятию: изменились детали мероприятия. Проверьте актуальную информацию в боте.'
 } as const;
 
 function rows(buttons: ReturnType<typeof Keyboard.button.callback>[][]) {
@@ -128,6 +152,40 @@ function rows(buttons: ReturnType<typeof Keyboard.button.callback>[][]) {
 
 function button(text: string, payload: string, intent: 'default' | 'positive' | 'negative' = 'default') {
   return Keyboard.button.callback(text, payload, { intent });
+}
+
+function parsePage(raw?: string): number {
+  const page = Number(raw);
+  return Number.isInteger(page) && page >= 0 ? page : 0;
+}
+
+function pageCount(total: number): number {
+  return Math.max(Math.ceil(total / pageSize), 1);
+}
+
+function clampPage(page: number, total: number): number {
+  return Math.min(Math.max(page, 0), pageCount(total) - 1);
+}
+
+function pageSlice<T>(items: T[], page: number): T[] {
+  return items.slice(page * pageSize, page * pageSize + pageSize);
+}
+
+function paginationButtons(page: number, total: number, payloadForPage: (page: number) => string): ReturnType<typeof Keyboard.button.callback>[] {
+  const totalPages = pageCount(total);
+  const buttons: ReturnType<typeof Keyboard.button.callback>[] = [];
+
+  if (page > 0) {
+    buttons.push(button('Назад', payloadForPage(page - 1)));
+  }
+
+  buttons.push(button(`${page + 1}/${totalPages}`, 'flow:noop'));
+
+  if (page + 1 < totalPages) {
+    buttons.push(button('Вперёд', payloadForPage(page + 1)));
+  }
+
+  return buttons;
 }
 
 function messageId(message: Awaited<ReturnType<AnyContext['reply']>>): string {
@@ -182,6 +240,8 @@ async function sendScreenMessage(ctx: AnyContext, text: string, extra?: ReplyExt
   return messageId(await ctx.reply(text, extra));
 }
 
+// Обычные экраны можно редактировать/пересоздавать, чтобы не спамить чат.
+// Для пошаговых сценариев ниже используется sendNewMessage: там новые сообщения удобнее.
 async function renderSingle(ctx: AnyContext, text: string, extra?: ReplyExtra): Promise<void> {
   const currentId = ctx.messageId;
 
@@ -233,6 +293,100 @@ function formatDate(iso: string): string {
     minute: '2-digit',
     timeZone: 'Europe/Moscow'
   }).format(new Date(iso));
+}
+
+// MAX callback payload лучше держать коротким, поэтому дату и время кодируем
+// компактно, а человеку показываем привычный формат ДД.ММ.ГГГГ и ЧЧ:ММ.
+function formatDateOnly(date: Date): string {
+  return new Intl.DateTimeFormat('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    timeZone: 'Europe/Moscow'
+  }).format(date);
+}
+
+function compactDate(date: Date): string {
+  const parts = new Intl.DateTimeFormat('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    timeZone: 'Europe/Moscow'
+  }).formatToParts(date);
+  const part = (type: string) => parts.find((item) => item.type === type)?.value ?? '';
+  return `${part('year')}${part('month')}${part('day')}`;
+}
+
+function dateFromCompact(value: string): string | undefined {
+  const match = value.match(/^(\d{4})(\d{2})(\d{2})$/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  return `${match[3]}.${match[2]}.${match[1]}`;
+}
+
+function timeFromCompact(value: string): string | undefined {
+  const match = value.match(/^(\d{2})(\d{2})$/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  return `${match[1]}:${match[2]}`;
+}
+
+function currentMoscowYearMonth(): { year: number; month: number } {
+  const parts = new Intl.DateTimeFormat('ru-RU', {
+    year: 'numeric',
+    month: '2-digit',
+    timeZone: 'Europe/Moscow'
+  }).formatToParts(new Date());
+  const part = (type: string) => parts.find((item) => item.type === type)?.value ?? '';
+  return { year: Number(part('year')), month: Number(part('month')) };
+}
+
+function yearMonthFromCompact(value?: string): { year: number; month: number } {
+  const match = value?.match(/^(\d{4})(\d{2})$/);
+
+  if (!match) {
+    return currentMoscowYearMonth();
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+
+  return month >= 1 && month <= 12 ? clampCalendarMonth(year, month) : currentMoscowYearMonth();
+}
+
+function compactYearMonth(year: number, month: number): string {
+  return `${year}${String(month).padStart(2, '0')}`;
+}
+
+function shiftYearMonth(year: number, month: number, offset: number): { year: number; month: number } {
+  const date = new Date(Date.UTC(year, month - 1 + offset, 1));
+  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1 };
+}
+
+function monthIndex(year: number, month: number): number {
+  return year * 12 + month;
+}
+
+function clampCalendarMonth(year: number, month: number): { year: number; month: number } {
+  const current = currentMoscowYearMonth();
+  const max = shiftYearMonth(current.year, current.month, 6);
+  const valueIndex = monthIndex(year, month);
+
+  if (valueIndex < monthIndex(current.year, current.month)) {
+    return current;
+  }
+
+  if (valueIndex > monthIndex(max.year, max.month)) {
+    return max;
+  }
+
+  return { year, month };
 }
 
 function userFlowKey(ctx: AnyContext): string | undefined {
@@ -339,7 +493,7 @@ async function requireConsent(ctx: AnyContext): Promise<StoredUser | undefined> 
   const user = await rememberUser(ctx);
 
   if (!user) {
-    await ctx.reply('Не удалось определить пользователя. Попробуйте открыть диалог с ботом напрямую.');
+    await ctx.reply(`${ui.error} Не удалось определить пользователя. Откройте диалог с ботом напрямую и попробуйте ещё раз.`);
     return undefined;
   }
 
@@ -355,7 +509,7 @@ async function showWelcome(ctx: AnyContext) {
   await renderSingle(
     ctx,
     [
-      'Весенний_код_40 помогает записаться на мероприятия университета: дни открытых дверей, экскурсии, консультации и пробные занятия.',
+      `${ui.info} Весенний_код_40 помогает записаться на мероприятия университета: дни открытых дверей, экскурсии, консультации и пробные занятия.`,
       '',
       'Сервис разработан командой хакатона университета и не является официальной функцией платформы MAX.',
       '',
@@ -375,25 +529,25 @@ async function showMainMenu(ctx: AnyContext, user?: StoredUser) {
   const menu = [
     [button('Все мероприятия', 'catalog')],
     [button('Выбрать вуз', 'universities')],
-    [button('Мои записи', 'my')]
+    [button('Мои записи на мероприятия', 'my')]
   ];
 
   if (current.role === 'organizer' || current.role === 'admin') {
-    menu.push([button('Меню организатора', 'org')]);
+    menu.push([button('Мероприятия организатора', 'org')]);
   }
 
   if (current.role === 'tech_admin') {
-    menu.push([button('Меню организатора', 'org')]);
+    menu.push([button('Мероприятия организатора', 'org')]);
   }
 
   if (current.role === 'admin' || current.role === 'tech_admin') {
     menu.push([button('Админ-панель', 'admin')]);
   }
 
-  await renderSingle(ctx, 'Выберите действие:', rows(menu));
+  await renderSingle(ctx, `${ui.info} Главное меню. Выберите, что хотите сделать.`, rows(menu));
 }
 
-async function showCatalog(ctx: AnyContext, universityId?: string) {
+async function showCatalog(ctx: AnyContext, universityId?: string, pageRaw = 0) {
   const user = await requireConsent(ctx);
 
   if (!user) {
@@ -403,26 +557,29 @@ async function showCatalog(ctx: AnyContext, universityId?: string) {
   const universities = await store.listUniversities();
   const universitiesById = new Map(universities.map((university) => [university.id, university]));
   const events = await store.listEvents(universityId);
+  const page = clampPage(pageRaw, events.length);
 
   if (events.length === 0) {
-    await renderSingle(ctx, 'Мероприятий пока нет.', rows([[button('Выбрать вуз', 'universities')], [button('Назад', 'menu')]]));
+    await renderSingle(ctx, `${ui.info} Мероприятий пока нет. Можно выбрать другой вуз или вернуться в главное меню.`, rows([[button('Выбрать вуз', 'universities')], [button('Назад', 'menu')]]));
     return;
   }
 
   const header = universityId
-    ? `Мероприятия выбранного вуза: ${universitiesById.get(universityId)?.shortTitle ?? universityId}`
-    : 'Все ближайшие мероприятия';
+    ? `${ui.list} Мероприятия выбранного вуза: ${universitiesById.get(universityId)?.shortTitle ?? universityId}`
+    : `${ui.list} Все ближайшие мероприятия`;
+  const pagePayload = (nextPage: number) => universityId ? `catalog:uni:${universityId}:${nextPage}` : `catalog:page:${nextPage}`;
   const messages: Array<{ text: string; extra?: ReplyExtra }> = [
     {
-      text: header,
+      text: `${header}\nСтраница ${page + 1} из ${pageCount(events.length)}.`,
       extra: rows([
+        ...(events.length > pageSize ? [paginationButtons(page, events.length, pagePayload)] : []),
         [button('Выбрать вуз', 'universities')],
         [button('Главное меню', 'menu')]
       ])
     }
   ];
 
-  for (const event of events) {
+  for (const event of pageSlice(events, page)) {
     const seats = await freeSeats(event);
     const buttons = [[button('Подробнее', `event:${event.id}`)]];
 
@@ -436,7 +593,7 @@ async function showCatalog(ctx: AnyContext, universityId?: string) {
   await renderMany(ctx, messages);
 }
 
-async function showUniversities(ctx: AnyContext) {
+async function showUniversities(ctx: AnyContext, pageRaw = 0) {
   const user = await requireConsent(ctx);
 
   if (!user) {
@@ -444,20 +601,25 @@ async function showUniversities(ctx: AnyContext) {
   }
 
   const universities = await store.listUniversities();
+  const page = clampPage(pageRaw, universities.length);
 
   if (universities.length === 0) {
-    await renderSingle(ctx, 'Список вузов пока пуст.', rows([[button('Назад', 'menu')]]));
+    await renderSingle(ctx, `${ui.info} Список вузов пока пуст. Попробуйте позже.`, rows([[button('Назад', 'menu')]]));
     return;
   }
 
   const messages: Array<{ text: string; extra?: ReplyExtra }> = [
     {
-      text: 'Выберите вуз:',
-      extra: rows([[button('Все мероприятия', 'catalog')], [button('Главное меню', 'menu')]])
+      text: `${ui.info} Выберите вуз. После выбора покажу только его мероприятия.\nСтраница ${page + 1} из ${pageCount(universities.length)}.`,
+      extra: rows([
+        ...(universities.length > pageSize ? [paginationButtons(page, universities.length, (nextPage) => `universities:page:${nextPage}`)] : []),
+        [button('Все мероприятия', 'catalog')],
+        [button('Главное меню', 'menu')]
+      ])
     }
   ];
 
-  for (const university of universities) {
+  for (const university of pageSlice(universities, page)) {
     messages.push({
       text: [
         university.title,
@@ -477,12 +639,12 @@ async function showEventDetails(ctx: AnyContext, eventId: string) {
   const event = await eventById(eventId);
 
   if (!event) {
-    await renderSingle(ctx, 'Мероприятие не найдено.', rows([[button('Назад', 'catalog')]]));
+    await renderSingle(ctx, `${ui.error} Мероприятие не найдено. Возможно, оно было удалено или изменено.`, rows([[button('Назад', 'catalog')]]));
     return;
   }
 
   if (event.deletedAt) {
-    await renderSingle(ctx, 'Мероприятие сейчас недоступно.', rows([[button('Все мероприятия', 'catalog')], [button('Главное меню', 'menu')]]));
+    await renderSingle(ctx, `${ui.warn} Мероприятие сейчас недоступно: оно скрыто из каталога.`, rows([[button('Все мероприятия', 'catalog')], [button('Главное меню', 'menu')]]));
     return;
   }
 
@@ -512,26 +674,26 @@ async function startEnrollment(ctx: AnyContext, eventId: string) {
   const event = await eventById(eventId);
 
   if (!user || !event || event.deletedAt) {
-    await renderSingle(ctx, 'Не удалось начать запись.', rows([[button('Назад', 'catalog')]]));
+    await renderSingle(ctx, `${ui.error} Не удалось начать запись. Мероприятие недоступно или уже удалено.`, rows([[button('Назад', 'catalog')]]));
     return;
   }
 
   if (event.registrationClosed || (await freeSeats(event)) <= 0) {
-    await renderSingle(ctx, 'Запись на это мероприятие сейчас недоступна.', rows([[button('Назад', `event:${event.id}`)]]));
+    await renderSingle(ctx, `${ui.warn} Запись на это мероприятие сейчас недоступна: регистрация закрыта или свободных мест нет.`, rows([[button('Назад', `event:${event.id}`)]]));
     return;
   }
 
   const existing = await store.activeRegistration(user.id, event.id);
 
   if (existing) {
-    await renderSingle(ctx, `Вы уже записаны. Код записи: ${existing.code}`, rows([[button('Мои записи', 'my')], [button('Назад', `event:${event.id}`)]]));
+    await renderSingle(ctx, `${ui.ok} Вы уже записаны на это мероприятие.\nКод записи: ${existing.code}`, rows([[button('Мои записи на мероприятия', 'my')], [button('Назад', `event:${event.id}`)]]));
     return;
   }
 
   if (event.slots.length > 0) {
     await renderSingle(
       ctx,
-      'Выберите слот:',
+      `${ui.time} Выберите удобный слот. После этого я покажу итог перед подтверждением.`,
       rows([
         ...event.slots.map((slot) => [button(slot.label, `slot:${event.id}:${slot.id}`, 'positive')]),
         [button('Назад', `event:${event.id}`)]
@@ -547,20 +709,20 @@ async function showEnrollmentSummary(ctx: AnyContext, eventId: string, slotId?: 
   const event = await eventById(eventId);
 
   if (!event) {
-    await renderSingle(ctx, 'Мероприятие не найдено.', rows([[button('Назад', 'catalog')]]));
+    await renderSingle(ctx, `${ui.error} Мероприятие не найдено. Вернитесь в каталог и выберите другое.`, rows([[button('Назад', 'catalog')]]));
     return;
   }
 
   await renderSingle(
     ctx,
     [
-      'Проверьте запись:',
+      `${ui.info} Проверьте запись перед подтверждением:`,
       `Мероприятие: ${event.title}`,
       `Дата: ${formatDate(event.startsAt)}`,
       `Слот: ${slotLabel(event, slotId)}`,
       `Формат: ${event.format === 'online' ? 'онлайн' : 'очно'}`,
       '',
-      'Запись можно отменить до начала мероприятия, чтобы освободить место.'
+      `${ui.info} Запись можно отменить до начала мероприятия, чтобы освободить место.`
     ].join('\n'),
     rows([
       [button('Подтвердить', `confirm:${event.id}:${slotId ?? '-'}`, 'positive')],
@@ -575,19 +737,19 @@ async function confirmEnrollment(ctx: AnyContext, eventId: string, slotIdRaw: st
   const slotId = slotIdRaw === '-' ? undefined : slotIdRaw;
 
   if (!user || !event) {
-    await renderSingle(ctx, 'Не удалось создать запись.', rows([[button('Назад', 'catalog')]]));
+    await renderSingle(ctx, `${ui.error} Не удалось создать запись. Попробуйте выбрать мероприятие заново.`, rows([[button('Назад', 'catalog')]]));
     return;
   }
 
   if (event.registrationClosed || (await freeSeats(event)) <= 0) {
-    await renderSingle(ctx, 'Свободных мест уже нет или регистрация закрыта.', rows([[button('Назад', `event:${event.id}`)]]));
+    await renderSingle(ctx, `${ui.warn} Свободных мест уже нет или регистрация закрыта.`, rows([[button('Назад', `event:${event.id}`)]]));
     return;
   }
 
   const existing = await store.activeRegistration(user.id, event.id);
 
   if (existing) {
-    await renderSingle(ctx, `Вы уже записаны. Код записи: ${existing.code}`, rows([[button('Мои записи', 'my')]]));
+    await renderSingle(ctx, `${ui.ok} Вы уже записаны.\nКод записи: ${existing.code}`, rows([[button('Мои записи на мероприятия', 'my')]]));
     return;
   }
 
@@ -606,43 +768,59 @@ async function confirmEnrollment(ctx: AnyContext, eventId: string, slotIdRaw: st
   };
 
   await store.createRegistration(registration);
+  logger.info(
+    businessLog('registration_confirmed', {
+      registration_id: registration.id,
+      registration_code: registration.code,
+      event_id: event.id,
+      university_id: event.universityId,
+      user_id: user.id,
+      slot_id: slotId
+    }),
+    'registration confirmed'
+  );
   await renderSingle(
     ctx,
     [
-      'Запись подтверждена.',
+      `${ui.ok} Запись подтверждена.`,
       `Код записи: ${registration.code}`,
       `Мероприятие: ${event.title}`,
       `Слот: ${slotLabel(event, slotId)}`
     ].join('\n'),
     rows([
-      [button('Мои записи', 'my')],
+      [button('Мои записи на мероприятия', 'my')],
+      [button('Главное меню', 'menu')],
       [button('Отключить уведомления', `mute:${registration.id}`, 'negative')]
     ])
   );
 }
 
-async function showMyRegistrations(ctx: AnyContext) {
+async function showMyRegistrations(ctx: AnyContext, pageRaw = 0) {
   const user = await requireConsent(ctx);
 
   if (!user) {
     return;
   }
 
-  const registrations = (await store.listRegistrations()).filter((item) => item.userId === user.id);
+  const registrations = (await store.listRegistrations()).filter((item) => item.userId === user.id && isActiveStatus(item.status));
+  const page = clampPage(pageRaw, registrations.length);
 
   if (registrations.length === 0) {
-    await renderSingle(ctx, 'У вас пока нет записей.', rows([[button('Все мероприятия', 'catalog')], [button('Главное меню', 'menu')]]));
+    await renderSingle(ctx, `${ui.info} У вас пока нет активных записей. Можно открыть каталог и выбрать мероприятие.`, rows([[button('Все мероприятия', 'catalog')], [button('Главное меню', 'menu')]]));
     return;
   }
 
   const messages: Array<{ text: string; extra?: ReplyExtra }> = [
     {
-      text: 'Мои записи',
-      extra: rows([[button('Главное меню', 'menu')]])
+      text: `${ui.list} Мои активные записи на мероприятия\nСтраница ${page + 1} из ${pageCount(registrations.length)}.`,
+      extra: rows([
+        ...(registrations.length > pageSize ? [paginationButtons(page, registrations.length, (nextPage) => `my:page:${nextPage}`)] : []),
+        [button('Главное меню', 'menu')]
+      ])
     }
   ];
 
-  for (const registration of registrations) {
+  for (const registration of pageSlice(registrations, page)) {
     const event = await eventById(registration.eventId);
 
     if (!event) {
@@ -678,19 +856,19 @@ async function cancelRegistration(ctx: AnyContext, registrationId: string) {
   const registration = registrations.find((item) => item.id === registrationId);
 
   if (!user || !registration || registration.userId !== user.id) {
-    await renderSingle(ctx, 'Запись не найдена.', rows([[button('Мои записи', 'my')]]));
+    await renderSingle(ctx, `${ui.error} Запись не найдена. Возможно, она уже была изменена.`, rows([[button('Мои записи на мероприятия', 'my')]]));
     return;
   }
 
   if (!isActiveStatus(registration.status)) {
-    await renderSingle(ctx, 'Эта запись уже не активна.', rows([[button('Мои записи', 'my')]]));
+    await renderSingle(ctx, `${ui.info} Эта запись уже не активна.`, rows([[button('Мои записи на мероприятия', 'my')]]));
     return;
   }
 
   const event = await eventById(registration.eventId);
 
   if (!event) {
-    await renderSingle(ctx, 'Мероприятие не найдено.', rows([[button('Мои записи', 'my')]]));
+    await renderSingle(ctx, `${ui.error} Мероприятие по этой записи не найдено.`, rows([[button('Мои записи на мероприятия', 'my')]]));
     return;
   }
 
@@ -698,12 +876,23 @@ async function cancelRegistration(ctx: AnyContext, registrationId: string) {
   const status: RegistrationStatus = started && event.lateCancelAllowed ? 'late_cancelled' : 'cancelled_by_user';
 
   if (started && !event.lateCancelAllowed) {
-    await renderSingle(ctx, 'Мероприятие уже началось, отмена по правилам этого мероприятия недоступна.', rows([[button('Мои записи', 'my')]]));
+    await renderSingle(ctx, `${ui.warn} Мероприятие уже началось, поэтому отмена по его правилам недоступна.`, rows([[button('Мои записи на мероприятия', 'my')]]));
     return;
   }
 
   await store.updateRegistration(registration.id, { status });
-  await renderSingle(ctx, 'Запись отменена. Место возвращено в пул доступных.', rows([[button('Все мероприятия', 'catalog')], [button('Мои записи', 'my')]]));
+  logger.info(
+    businessLog('registration_cancelled_by_user', {
+      registration_id: registration.id,
+      registration_code: registration.code,
+      event_id: event.id,
+      university_id: event.universityId,
+      user_id: user.id,
+      status
+    }),
+    'registration cancelled by user'
+  );
+  await renderSingle(ctx, `${ui.cancel} Запись отменена. Она больше не будет показываться в активных записях.`, rows([[button('Все мероприятия', 'catalog')], [button('Главное меню', 'menu')]]));
 }
 
 async function toggleNotifications(ctx: AnyContext, registrationId: string, enabled: boolean) {
@@ -712,12 +901,21 @@ async function toggleNotifications(ctx: AnyContext, registrationId: string, enab
   const registration = registrations.find((item) => item.id === registrationId);
 
   if (!user || !registration || registration.userId !== user.id) {
-    await renderSingle(ctx, 'Запись не найдена.', rows([[button('Мои записи', 'my')]]));
+    await renderSingle(ctx, `${ui.error} Запись не найдена. Откройте список своих записей и попробуйте ещё раз.`, rows([[button('Мои записи на мероприятия', 'my')]]));
     return;
   }
 
   await store.updateRegistration(registration.id, { notificationsEnabled: enabled });
-  await renderSingle(ctx, enabled ? 'Уведомления по мероприятию включены.' : 'Уведомления по мероприятию отключены.', rows([[button('Мои записи', 'my')]]));
+  logger.info(
+    businessLog(enabled ? 'registration_notifications_enabled' : 'registration_notifications_disabled', {
+      registration_id: registration.id,
+      registration_code: registration.code,
+      event_id: registration.eventId,
+      user_id: user.id
+    }),
+    'registration notification preference changed'
+  );
+  await renderSingle(ctx, enabled ? `${ui.ok} Уведомления по мероприятию включены.` : `${ui.cancel} Уведомления по мероприятию отключены.`, rows([[button('Мои записи на мероприятия', 'my')]]));
 }
 
 function canManage(user: StoredUser, event: EventCard): boolean {
@@ -811,6 +1009,83 @@ function parseEventDate(raw: string): string | undefined {
 
 function parseEventDateTime(dateRaw: string, timeRaw: string): string | undefined {
   return parseEventDate(`${dateRaw.trim()} ${timeRaw.trim()}`);
+}
+
+function normalizeDateInput(raw: string): string | undefined {
+  const match = raw.trim().match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+\d{1,2}:\d{2})?$/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  const day = match[1].padStart(2, '0');
+  const month = match[2].padStart(2, '0');
+  const year = match[3];
+  const normalized = `${day}.${month}.${year}`;
+
+  return parseEventDate(normalized) ? normalized : undefined;
+}
+
+function normalizeTimeInput(raw: string): string | undefined {
+  const match = raw.trim().match(/^(\d{1,2}):(\d{2})$/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  const normalized = `${match[1].padStart(2, '0')}:${match[2]}`;
+  return parseClockTime(normalized) ? normalized : undefined;
+}
+
+function parseClockTime(raw: string): { hour: number; minute: number } | undefined {
+  const match = raw.match(/^(\d{2}):(\d{2})$/);
+  if (!match) return undefined;
+
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return undefined;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return undefined;
+
+  return { hour, minute };
+}
+
+function minutesOfDay(time: { hour: number; minute: number }): number {
+  return time.hour * 60 + time.minute;
+}
+
+function slotInterval(label: string): { start: number; end: number } | undefined {
+  const match = label.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  const start = parseClockTime(`${match[1]}:${match[2]}`);
+  const end = parseClockTime(`${match[3]}:${match[4]}`);
+
+  if (!start || !end) {
+    return undefined;
+  }
+
+  return { start: minutesOfDay(start), end: minutesOfDay(end) };
+}
+
+function slotsOverlap(left: EventSlot, right: EventSlot): boolean {
+  const leftInterval = slotInterval(left.label);
+  const rightInterval = slotInterval(right.label);
+  return !!leftInterval && !!rightInterval && leftInterval.start < rightInterval.end && rightInterval.start < leftInterval.end;
+}
+
+function timeFromMinutes(totalMinutes: number): string {
+  const normalized = ((totalMinutes % (24 * 60)) + 24 * 60) % (24 * 60);
+  const hour = Math.floor(normalized / 60);
+  const minute = normalized % 60;
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+function slotIdFromLabel(label: string): string {
+  return label.replace(/[^0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
 function parseCreateEventInput(raw: string, user: StoredUser): CreateEventInput | string {
@@ -945,7 +1220,6 @@ function nextCreateEventStep(step: CreateEventStep): CreateEventStep {
     'university',
     'title',
     'date',
-    'time',
     'duration',
     'format',
     'capacity',
@@ -962,30 +1236,245 @@ function nextCreateEventStep(step: CreateEventStep): CreateEventStep {
 
 function createEventPrompt(step: CreateEventStep): string {
   const prompts: Record<CreateEventStep, string> = {
-    university: 'Введите university_id вуза, для которого создается мероприятие. Например: rtu-mirea',
-    title: 'Введите название мероприятия.',
-    date: 'Введите дату мероприятия в формате ДД.ММ.ГГГГ. Например: 15.06.2026',
-    time: 'Введите время начала в формате ЧЧ:ММ. Например: 15:00',
-    duration: 'Введите длительность в минутах. Например: 60',
-    format: 'Введите формат: online или offline.',
-    capacity: 'Введите лимит мест числом. Например: 30',
-    location: 'Введите место или ссылку.',
-    description: 'Введите описание мероприятия.',
-    requirements: 'Введите требования к участнику. Если требований нет, отправьте "-".',
-    cancelPolicy: 'Введите правила отмены. Если подходят стандартные, отправьте "-".',
-    lateCancelAllowed: 'Разрешить позднюю отмену после старта? Ответьте да или нет.',
-    slots: 'Введите слоты через запятую в формате ЧЧ:ММ-ЧЧ:ММ. Например: 15:00-16:00, 17:00-18:00. Если слоты не нужны, отправьте "-".',
-    confirm: 'Проверьте данные и отправьте "да" для создания или "нет" для отмены.'
+    university: `${ui.info} Введите university_id вуза, для которого создаётся мероприятие. Например: rtu-mirea`,
+    title: `${ui.info} Введите название мероприятия. Оно будет видно участникам в каталоге.`,
+    date: `${ui.calendar} Выберите дату в календаре на ближайшие 6 месяцев или введите вручную в формате ДД.ММ.ГГГГ. Например: 15.06.2026`,
+    duration: `${ui.info} Введите длительность одного слота в минутах. Например: 60`,
+    format: `${ui.info} Введите формат мероприятия: online или offline.`,
+    capacity: `${ui.info} Введите лимит мест числом. Например: 30`,
+    location: `${ui.info} Введите место проведения или ссылку для подключения.`,
+    description: `${ui.info} Введите описание мероприятия: что будет происходить и кому это полезно.`,
+    requirements: `${ui.info} Введите требования к участнику. Если требований нет, отправьте "-".`,
+    cancelPolicy: `${ui.info} Введите правила отмены. Если подходят стандартные, отправьте "-".`,
+    lateCancelAllowed: `${ui.info} Разрешить позднюю отмену после старта? Ответьте да или нет.`,
+    slots: `${ui.time} Добавьте хотя бы один слот кнопками ниже. Можно также отправить слоты текстом через запятую: 15:00-16:00, 17:00-18:00.`,
+    confirm: `${ui.info} Проверьте данные. Отправьте "да", чтобы создать мероприятие, или "нет", чтобы отменить.`
   };
   return prompts[step];
 }
 
+function createStepExtra(step: CreateEventStep, draft?: EventDraft): ReplyExtra | undefined {
+  if (step === 'date') {
+    return createDateKeyboard('create');
+  }
+
+  if (step === 'slots') {
+    return createSlotBuilderKeyboard('create', draft?.slots?.length ?? 0);
+  }
+
+  return rows([[button('Отмена', 'flow:cancel')]]);
+}
+
+function editValueExtra(field: EditableEventField): ReplyExtra {
+  if (field === 'date') {
+    return createDateKeyboard('edit');
+  }
+
+  if (field === 'time') {
+    return createHourKeyboard('edit');
+  }
+
+  if (field === 'slots') {
+    return createSlotBuilderKeyboard('edit', 0);
+  }
+
+  return rows([[button('Отмена', 'flow:cancel')]]);
+}
+
+function callbackPrefix(mode: 'create' | 'edit', action: 'date' | 'month' | 'hour' | 'minute' | 'slot-hour' | 'slot-minute' | 'slot-finish' | 'slot-clear'): string {
+  return `flow:${mode}-${action}`;
+}
+
+// Календарь сделан настоящей сеткой по дням недели: так меньше ошибок при
+// выборе даты, а ручной ввод всё равно остаётся для нестандартных случаев.
+function createDateKeyboard(mode: 'create' | 'edit', monthRaw?: string): ReplyExtra {
+  const { year, month } = yearMonthFromCompact(monthRaw);
+  const firstDay = new Date(Date.UTC(year, month - 1, 1));
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const mondayOffset = (firstDay.getUTCDay() + 6) % 7;
+  const current = currentMoscowYearMonth();
+  const max = shiftYearMonth(current.year, current.month, 6);
+  const canGoPrevious = monthIndex(year, month) > monthIndex(current.year, current.month);
+  const canGoNext = monthIndex(year, month) < monthIndex(max.year, max.month);
+  const todayCompact = compactDate(new Date());
+  const monthTitle = new Intl.DateTimeFormat('ru-RU', {
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'UTC'
+  }).format(firstDay);
+  const dateRows: ReturnType<typeof Keyboard.button.callback>[][] = [];
+  const previousMonth = shiftYearMonth(year, month, -1);
+  const nextMonth = shiftYearMonth(year, month, 1);
+
+  dateRows.push([button(monthTitle, 'flow:noop')]);
+  dateRows.push(['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].map((day) => button(day, 'flow:noop')));
+
+  for (let cursor = 1 - mondayOffset; cursor <= daysInMonth; cursor += 7) {
+    const week: ReturnType<typeof Keyboard.button.callback>[] = [];
+
+    for (let weekday = 0; weekday < 7; weekday += 1) {
+      const day = cursor + weekday;
+
+      if (day < 1 || day > daysInMonth) {
+        week.push(button('.', 'flow:noop'));
+        continue;
+      }
+
+      const date = new Date(Date.UTC(year, month - 1, day));
+      const compact = compactDate(date);
+      week.push(button(String(day).padStart(2, '0'), compact < todayCompact ? 'flow:noop' : `${callbackPrefix(mode, 'date')}:${compact}`));
+    }
+
+    dateRows.push(week);
+  }
+
+  dateRows.push([
+    button('Пред. месяц', canGoPrevious ? `${callbackPrefix(mode, 'month')}:${compactYearMonth(previousMonth.year, previousMonth.month)}` : 'flow:noop'),
+    button('След. месяц', canGoNext ? `${callbackPrefix(mode, 'month')}:${compactYearMonth(nextMonth.year, nextMonth.month)}` : 'flow:noop')
+  ]);
+  dateRows.push([button('Отмена', 'flow:cancel')]);
+  return rows(dateRows);
+}
+
+function createHourKeyboard(mode: 'create' | 'edit'): ReplyExtra {
+  const hourRows: ReturnType<typeof Keyboard.button.callback>[][] = [];
+
+  for (let hour = 0; hour < 24; hour += 4) {
+    hourRows.push(
+      Array.from({ length: 4 }, (_, index) => {
+        const value = String(hour + index).padStart(2, '0');
+        return button(value, `${callbackPrefix(mode, 'hour')}:${value}`);
+      })
+    );
+  }
+
+  hourRows.push([button('Отмена', 'flow:cancel')]);
+  return rows(hourRows);
+}
+
+function createMinuteKeyboard(mode: 'create' | 'edit', hour: string): ReplyExtra {
+  const minuteRows: ReturnType<typeof Keyboard.button.callback>[][] = [];
+
+  for (let minute = 0; minute < 60; minute += 20) {
+    minuteRows.push(
+      Array.from({ length: 4 }, (_, index) => {
+        const value = String(minute + index * 5).padStart(2, '0');
+        return button(value, `${callbackPrefix(mode, 'minute')}:${hour}${value}`);
+      })
+    );
+  }
+
+  minuteRows.push([button('Назад к часам', `${callbackPrefix(mode, 'hour')}:back`)]);
+  minuteRows.push([button('Отмена', 'flow:cancel')]);
+  return rows(minuteRows);
+}
+
+function createSlotBuilderKeyboard(mode: 'create' | 'edit', count: number): ReplyExtra {
+  return rows([
+    [button('Добавить слот', `${callbackPrefix(mode, 'slot-hour')}:start`, 'positive')],
+    ...(count > 0 ? [[button('Готово, сохранить слоты', `${callbackPrefix(mode, 'slot-finish')}:save`, 'positive')]] : []),
+    ...(count > 0 ? [[button('Очистить слоты', `${callbackPrefix(mode, 'slot-clear')}:all`, 'negative')]] : []),
+    [button('Отмена', 'flow:cancel')]
+  ]);
+}
+
+function createSlotHourKeyboard(mode: 'create' | 'edit'): ReplyExtra {
+  const hourRows: ReturnType<typeof Keyboard.button.callback>[][] = [];
+
+  for (let hour = 0; hour < 24; hour += 4) {
+    hourRows.push(
+      Array.from({ length: 4 }, (_, index) => {
+        const value = String(hour + index).padStart(2, '0');
+        return button(value, `${callbackPrefix(mode, 'slot-hour')}:${value}`);
+      })
+    );
+  }
+
+  hourRows.push([button('Назад к слотам', `${callbackPrefix(mode, 'slot-hour')}:back`)]);
+  hourRows.push([button('Отмена', 'flow:cancel')]);
+  return rows(hourRows);
+}
+
+function createSlotMinuteKeyboard(mode: 'create' | 'edit', hour: string): ReplyExtra {
+  const minuteRows: ReturnType<typeof Keyboard.button.callback>[][] = [];
+
+  for (let minute = 0; minute < 60; minute += 20) {
+    minuteRows.push(
+      Array.from({ length: 4 }, (_, index) => {
+        const value = String(minute + index * 5).padStart(2, '0');
+        return button(value, `${callbackPrefix(mode, 'slot-minute')}:${hour}${value}`);
+      })
+    );
+  }
+
+  minuteRows.push([button('Назад к часам', `${callbackPrefix(mode, 'slot-hour')}:start`)]);
+  minuteRows.push([button('Отмена', 'flow:cancel')]);
+  return rows(minuteRows);
+}
+
+function createSlotFromStart(dateRaw: string, startRaw: string, durationMinutes: number, existing: EventSlot[] = []): EventSlot | string {
+  const start = parseClockTime(startRaw);
+
+  if (!start) {
+    return 'Время начала слота не распознано.';
+  }
+
+  const startTotal = minutesOfDay(start);
+  const endTotal = startTotal + durationMinutes;
+
+  if (endTotal > 24 * 60) {
+    return 'Слот не должен переходить на следующий день. Выберите более раннее время или уменьшите длительность.';
+  }
+
+  const label = `${startRaw}-${timeFromMinutes(endTotal)}`;
+
+  if (existing.some((slot) => slot.label === label || slot.id === slotIdFromLabel(label))) {
+    return `Слот ${label} уже добавлен.`;
+  }
+
+  const candidate: EventSlot = {
+    id: slotIdFromLabel(label),
+    label,
+    startsAt: ''
+  };
+
+  if (existing.some((slot) => slotsOverlap(candidate, slot))) {
+    return `Слот ${label} пересекается с уже добавленным слотом. Выберите другое время.`;
+  }
+
+  const startsAt = parseEventDate(`${dateRaw} ${startRaw}`);
+
+  if (!startsAt) {
+    return 'Не удалось собрать дату и время слота.';
+  }
+
+  return {
+    id: candidate.id,
+    label,
+    startsAt
+  };
+}
+
+function formatSlotBuilderText(slots: EventSlot[] = []): string {
+  return [
+    `${ui.time} Слоты мероприятия`,
+    slots.length > 0 ? `Добавлено: ${slots.map((slot) => slot.label).join(', ')}` : 'Пока нет слотов. Добавьте хотя бы один.',
+    '',
+    'Первый слот будет временем начала мероприятия. Участник при записи выберет один из этих слотов.'
+  ].join('\n');
+}
+
 function buildEventInputFromDraft(draft: EventDraft): CreateEventInput | string {
-  if (!draft.universityId || !draft.title || !draft.date || !draft.time || !draft.durationMinutes || !draft.format || !draft.capacity || !draft.locationOrUrl || !draft.description) {
+  if (!draft.universityId || !draft.title || !draft.date || !draft.durationMinutes || !draft.format || !draft.capacity || !draft.locationOrUrl || !draft.description) {
     return 'Черновик неполный. Начните создание заново.';
   }
 
-  const startsAt = parseEventDateTime(draft.date, draft.time);
+  if (!draft.slots?.length) {
+    return 'Добавьте хотя бы один слот. По первому слоту бот определит время начала мероприятия.';
+  }
+
+  const [firstSlot] = [...draft.slots].sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime());
+  const startsAt = firstSlot.startsAt;
 
   if (!startsAt) {
     return 'Дата или время не распознаны. Начните создание заново.';
@@ -1009,12 +1498,16 @@ function buildEventInputFromDraft(draft: EventDraft): CreateEventInput | string 
 }
 
 function formatEventDraft(draft: EventDraft): string {
+  const firstSlot = draft.slots?.length
+    ? [...draft.slots].sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime())[0]
+    : undefined;
+
   return [
     `Вуз: ${draft.universityId ?? '-'}`,
     `Название: ${draft.title ?? '-'}`,
     `Дата: ${draft.date ?? '-'}`,
-    `Время: ${draft.time ?? '-'}`,
-    `Длительность: ${draft.durationMinutes ?? '-'} мин.`,
+    `Время начала: ${firstSlot ? firstSlot.label.split('-')[0] : '-'}`,
+    `Длительность слота: ${draft.durationMinutes ?? '-'} мин.`,
     `Формат: ${draft.format ?? '-'}`,
     `Лимит: ${draft.capacity ?? '-'}`,
     `Место/ссылка: ${draft.locationOrUrl ?? '-'}`,
@@ -1031,11 +1524,22 @@ function parseSlots(raw: string, dateRaw: string): EventSlot[] {
     return [];
   }
 
-  return raw.split(',').map((part) => part.trim()).map((label) => {
+  const slots = raw.split(',').map((part) => part.trim()).map((label) => {
     const match = label.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/);
 
     if (!match) {
       throw new Error(`Слот "${label}" должен быть в формате ЧЧ:ММ-ЧЧ:ММ.`);
+    }
+
+    const startTime = parseClockTime(`${match[1]}:${match[2]}`);
+    const endTime = parseClockTime(`${match[3]}:${match[4]}`);
+
+    if (!startTime || !endTime) {
+      throw new Error(`В слоте "${label}" часы должны быть 00-23, минуты 00-59.`);
+    }
+
+    if (minutesOfDay(endTime) <= minutesOfDay(startTime)) {
+      throw new Error(`В слоте "${label}" время окончания должно быть позже начала.`);
     }
 
     const startsAt = parseEventDate(`${dateRaw} ${match[1]}:${match[2]}`);
@@ -1045,11 +1549,21 @@ function parseSlots(raw: string, dateRaw: string): EventSlot[] {
     }
 
     return {
-      id: label.replace(/[^0-9]+/g, '-').replace(/^-+|-+$/g, ''),
+      id: slotIdFromLabel(label),
       label,
       startsAt
     };
   });
+
+  for (let left = 0; left < slots.length; left += 1) {
+    for (let right = left + 1; right < slots.length; right += 1) {
+      if (slotsOverlap(slots[left], slots[right])) {
+        throw new Error(`Слоты "${slots[left].label}" и "${slots[right].label}" пересекаются.`);
+      }
+    }
+  }
+
+  return slots;
 }
 
 function editableFieldLabels(): Record<EditableEventField, string> {
@@ -1089,17 +1603,17 @@ function eventFieldKeyboard(eventId: string) {
 function editValuePrompt(field: EditableEventField): string {
   const labels = editableFieldLabels();
   const hints: Partial<Record<EditableEventField, string>> = {
-    date: 'Введите новую дату в формате ДД.ММ.ГГГГ. Например: 15.06.2026',
-    time: 'Введите новое время в формате ЧЧ:ММ. Например: 15:00',
-    duration: 'Введите новую длительность в минутах.',
-    format: 'Введите online или offline.',
-    capacity: 'Введите новый лимит мест числом.',
-    registrationClosed: 'Закрыть регистрацию? Ответьте да или нет.',
-    lateCancelAllowed: 'Разрешить позднюю отмену? Ответьте да или нет.',
-    slots: 'Введите слоты через запятую в формате ЧЧ:ММ-ЧЧ:ММ. Например: 15:00-16:00, 17:00-18:00. Чтобы убрать слоты, отправьте "-".'
+    date: `${ui.calendar} Выберите новую дату в календаре на ближайшие 6 месяцев или введите ДД.ММ.ГГГГ. Например: 15.06.2026`,
+    time: `${ui.time} Выберите час, затем минуты, или введите новое время в формате ЧЧ:ММ. Например: 15:00`,
+    duration: `${ui.info} Введите новую длительность в минутах.`,
+    format: `${ui.info} Введите формат: online или offline.`,
+    capacity: `${ui.info} Введите новый лимит мест числом.`,
+    registrationClosed: `${ui.info} Закрыть регистрацию? Ответьте да или нет.`,
+    lateCancelAllowed: `${ui.info} Разрешить позднюю отмену? Ответьте да или нет.`,
+    slots: `${ui.time} Добавьте слоты кнопками ниже. Можно также отправить слоты текстом через запятую: 15:00-16:00, 17:00-18:00. Слоты не должны пересекаться.`
   };
 
-  return hints[field] ?? `Введите новое значение для поля "${labels[field]}".`;
+  return hints[field] ?? `${ui.info} Введите новое значение для поля "${labels[field]}".`;
 }
 
 function buildEditPatch(event: EventCard, field: EditableEventField, raw: string): { patch: UpdateEventInput; label: string } | string {
@@ -1122,22 +1636,30 @@ function buildEditPatch(event: EventCard, field: EditableEventField, raw: string
     case 'location':
       return { patch: { locationOrUrl: value }, label: labels[field] };
     case 'date': {
+      const date = normalizeDateInput(value);
+      if (!date) {
+        return 'Дата не распознана. Используйте ДД.ММ.ГГГГ.';
+      }
       const currentTime = new Intl.DateTimeFormat('ru-RU', {
         hour: '2-digit',
         minute: '2-digit',
         timeZone: 'Europe/Moscow'
       }).format(new Date(event.startsAt));
-      const startsAt = parseEventDateTime(value, currentTime);
+      const startsAt = parseEventDateTime(date, currentTime);
       return startsAt ? { patch: { startsAt }, label: labels[field] } : 'Дата не распознана. Используйте ДД.ММ.ГГГГ.';
     }
     case 'time': {
+      const time = normalizeTimeInput(value);
+      if (!time) {
+        return 'Время не распознано. Используйте ЧЧ:ММ.';
+      }
       const currentDate = new Intl.DateTimeFormat('ru-RU', {
         day: '2-digit',
         month: '2-digit',
         year: 'numeric',
         timeZone: 'Europe/Moscow'
       }).format(new Date(event.startsAt));
-      const startsAt = parseEventDateTime(currentDate, value);
+      const startsAt = parseEventDateTime(currentDate, time);
       return startsAt ? { patch: { startsAt }, label: labels[field] } : 'Время не распознано. Используйте ЧЧ:ММ.';
     }
     case 'duration': {
@@ -1169,7 +1691,9 @@ function buildEditPatch(event: EventCard, field: EditableEventField, raw: string
       }).format(new Date(event.startsAt));
 
       try {
-        return { patch: { slots: parseSlots(value, currentDate) }, label: labels[field] };
+        const slots = parseSlots(value, currentDate);
+        const startsAt = slots.length > 0 ? [...slots].sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime())[0].startsAt : event.startsAt;
+        return { patch: { startsAt, slots }, label: labels[field] };
       } catch (error) {
         return error instanceof Error ? error.message : 'Не удалось разобрать слоты.';
       }
@@ -1177,20 +1701,21 @@ function buildEditPatch(event: EventCard, field: EditableEventField, raw: string
   }
 }
 
-async function showOrganizerMenu(ctx: AnyContext) {
+async function showOrganizerMenu(ctx: AnyContext, pageRaw = 0) {
   const user = await requireConsent(ctx);
 
   if (!user || (user.role !== 'admin' && user.role !== 'tech_admin' && user.role !== 'organizer')) {
-    await renderSingle(ctx, 'Меню организатора доступно только организатору или администратору.', rows([[button('Главное меню', 'menu')]]));
+    await renderSingle(ctx, `${ui.warn} Меню организатора доступно только организатору или администратору.`, rows([[button('Главное меню', 'menu')]]));
     return;
   }
 
   const manageable = await store.listManageableEvents(user.id, user.role);
+  const page = clampPage(pageRaw, manageable.length);
 
   if (manageable.length === 0) {
     await renderSingle(
       ctx,
-      ['За вами пока не закреплены мероприятия.', '', canCreateEvent(user) ? eventCreateHelp(user.universityId) : 'Доступных мероприятий пока нет.'].join('\n'),
+      [`${ui.info} За вами пока не закреплены мероприятия.`, '', canCreateEvent(user) ? eventCreateHelp(user.universityId) : 'Доступных мероприятий пока нет.'].join('\n'),
       rows([...(canCreateEvent(user) ? [[button('Создать мероприятие', 'org:create')]] : []), [button('Главное меню', 'menu')]])
     );
     return;
@@ -1198,10 +1723,11 @@ async function showOrganizerMenu(ctx: AnyContext) {
 
   await renderSingle(
     ctx,
-    ['Ваши мероприятия:', '', canCreateEvent(user) ? 'Создание и изменение проходят пошагово через /org_create и /org_edit.' : 'Доступные действия откроются в карточке мероприятия.'].join('\n'),
+      [`${ui.list} Мероприятия организатора:`, `Страница ${page + 1} из ${pageCount(manageable.length)}.`, '', 'Здесь показаны мероприятия, которыми вы управляете. Личные записи на мероприятия находятся в отдельном пункте "Мои записи на мероприятия".', '', canCreateEvent(user) ? 'Создание и изменение проходят пошагово через /org_create и /org_edit.' : 'Доступные действия откроются в карточке мероприятия.'].join('\n'),
     rows([
+      ...(manageable.length > pageSize ? [paginationButtons(page, manageable.length, (nextPage) => `org:page:${nextPage}`)] : []),
       ...(canCreateEvent(user) ? [[button('Создать мероприятие', 'org:create')]] : []),
-      ...manageable.map((event) => [button(`${event.deletedAt ? '[Удалено] ' : ''}${event.title}`, `org:event:${event.id}`)]),
+      ...pageSlice(manageable, page).map((event) => [button(`${event.deletedAt ? '[Удалено] ' : ''}${event.title}`, `org:event:${event.id}`)]),
       [button('Назад', 'menu')]
     ])
   );
@@ -1211,7 +1737,7 @@ async function showCreateEventHelp(ctx: AnyContext) {
   const user = await requireConsent(ctx);
 
   if (!user || !canCreateEvent(user)) {
-    await renderSingle(ctx, 'Создание мероприятий доступно только организатору, админу своего вуза или техадмину.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.warn} Создание мероприятий доступно только организатору, админу своего вуза или техадмину.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
@@ -1222,7 +1748,7 @@ async function createEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
   const user = await requireConsent(ctx);
 
   if (!user || !canCreateEvent(user)) {
-    await renderSingle(ctx, 'Создание мероприятий доступно только организатору, админу своего вуза или техадмину.', rows([[button('Главное меню', 'menu')]]));
+    await renderSingle(ctx, `${ui.warn} Создание мероприятий доступно только организатору, админу своего вуза или техадмину.`, rows([[button('Главное меню', 'menu')]]));
     return;
   }
 
@@ -1234,27 +1760,27 @@ async function createEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
   const input = parseCreateEventInput(raw, user);
 
   if (typeof input === 'string') {
-    await renderSingle(ctx, [input, '', eventCreateHelp(user.universityId)].join('\n'), rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, [`${ui.error} ${input}`, '', eventCreateHelp(user.universityId)].join('\n'), rows([[button('Назад', 'org')]]));
     return;
   }
 
   const university = await store.getUniversity(input.universityId);
 
   if (!university) {
-    await renderSingle(ctx, `Вуз ${input.universityId} не найден.`, rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.error} Вуз ${input.universityId} не найден. Проверьте university_id.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
   const event = await store.createEvent(input);
-  logger.info({ eventId: event.id, userId: user.id, universityId: event.universityId }, 'event created by organizer');
-  await renderSingle(ctx, `Мероприятие создано:\n${formatEvent(event, event.capacity, university)}`, rows([[button('Открыть', `org:event:${event.id}`)], [button('Назад', 'org')]]));
+  logger.info(businessLog('event_created', { event_id: event.id, user_id: user.id, university_id: event.universityId, source: 'command' }), 'event created by organizer');
+  await renderSingle(ctx, `${ui.ok} Мероприятие создано:\n${formatEvent(event, event.capacity, university)}`, rows([[button('Открыть', `org:event:${event.id}`)], [button('Назад', 'org')]]));
 }
 
 async function startCreateEventFlow(ctx: AnyContext, user: StoredUser): Promise<void> {
   const key = userFlowKey(ctx);
 
   if (!key) {
-    await sendNewMessage(ctx, 'Не удалось определить пользователя.');
+    await sendNewMessage(ctx, `${ui.error} Не удалось определить пользователя. Откройте диалог с ботом напрямую и попробуйте ещё раз.`);
     return;
   }
 
@@ -1262,12 +1788,12 @@ async function startCreateEventFlow(ctx: AnyContext, user: StoredUser): Promise<
   const draft: EventDraft = user.role === 'tech_admin' ? {} : { universityId: user.universityId };
 
   if (!draft.universityId && user.role !== 'tech_admin') {
-    await sendNewMessage(ctx, 'У вас не указан вуз. Обратитесь к техадмину.');
+    await sendNewMessage(ctx, `${ui.warn} У вас не указан вуз. Обратитесь к техадмину, чтобы он привязал вас к вузу.`);
     return;
   }
 
   flowStates.set(key, { kind: 'create_event', step, draft });
-  await sendNewMessage(ctx, [eventCreateHelp(draft.universityId), '', createEventPrompt(step)].join('\n'), rows([[button('Отмена', 'flow:cancel')]]));
+  await sendNewMessage(ctx, [eventCreateHelp(draft.universityId), '', createEventPrompt(step)].join('\n'), createStepExtra(step, draft));
 }
 
 async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, { kind: 'create_event' }>, text: string): Promise<void> {
@@ -1286,7 +1812,7 @@ async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, 
       case 'university': {
         const university = await store.getUniversity(value);
         if (!university) {
-          await sendNewMessage(ctx, 'Вуз не найден. Введите существующий university_id.');
+          await sendNewMessage(ctx, `${ui.error} Вуз не найден. Введите существующий university_id.`);
           return;
         }
         draft.universityId = value;
@@ -1295,24 +1821,19 @@ async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, 
       case 'title':
         draft.title = value;
         break;
-      case 'date':
-        if (!parseEventDate(value)) {
-          await sendNewMessage(ctx, 'Дата не распознана. Введите дату в формате ДД.ММ.ГГГГ, например 15.06.2026.');
+      case 'date': {
+        const date = normalizeDateInput(value);
+        if (!date) {
+          await sendNewMessage(ctx, `${ui.error} Дата не распознана. Выберите дату в календаре или введите ДД.ММ.ГГГГ, например 15.06.2026.`, createStepExtra('date', draft));
           return;
         }
-        draft.date = value;
+        draft.date = date;
         break;
-      case 'time':
-        if (!/^\d{2}:\d{2}$/.test(value) || !draft.date || !parseEventDateTime(draft.date, value)) {
-          await sendNewMessage(ctx, 'Время не распознано. Введите в формате ЧЧ:ММ, например 15:00.');
-          return;
-        }
-        draft.time = value;
-        break;
+      }
       case 'duration': {
         const durationMinutes = Number(value);
         if (!Number.isInteger(durationMinutes) || durationMinutes <= 0) {
-          await sendNewMessage(ctx, 'Длительность должна быть целым числом минут больше нуля.');
+          await sendNewMessage(ctx, `${ui.error} Длительность должна быть целым числом минут больше нуля.`);
           return;
         }
         draft.durationMinutes = durationMinutes;
@@ -1321,7 +1842,7 @@ async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, 
       case 'format': {
         const format = value.toLowerCase() as EventFormat;
         if (format !== 'online' && format !== 'offline') {
-          await sendNewMessage(ctx, 'Введите online или offline.');
+          await sendNewMessage(ctx, `${ui.error} Введите формат строго как online или offline.`);
           return;
         }
         draft.format = format;
@@ -1330,7 +1851,7 @@ async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, 
       case 'capacity': {
         const capacity = Number(value);
         if (!Number.isInteger(capacity) || capacity <= 0) {
-          await sendNewMessage(ctx, 'Лимит мест должен быть целым числом больше нуля.');
+          await sendNewMessage(ctx, `${ui.error} Лимит мест должен быть целым числом больше нуля.`);
           return;
         }
         draft.capacity = capacity;
@@ -1351,7 +1872,7 @@ async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, 
       case 'lateCancelAllowed': {
         const lateCancelAllowed = parseBoolean(value);
         if (lateCancelAllowed === undefined) {
-          await sendNewMessage(ctx, 'Ответьте да или нет.');
+          await sendNewMessage(ctx, `${ui.error} Ответьте "да" или "нет".`);
           return;
         }
         draft.lateCancelAllowed = lateCancelAllowed;
@@ -1359,15 +1880,19 @@ async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, 
       }
       case 'slots': {
         if (!draft.date) {
-          await sendNewMessage(ctx, 'Дата потерялась. Начните создание заново.');
+          await sendNewMessage(ctx, `${ui.warn} Дата потерялась. Начните создание мероприятия заново.`);
           flowStates.delete(key);
           return;
         }
         try {
           const slots = parseSlots(value, draft.date);
+          if (slots.length === 0) {
+            await sendNewMessage(ctx, `${ui.error} Добавьте хотя бы один слот.`, createStepExtra('slots', draft));
+            return;
+          }
           draft.slots = slots;
         } catch (error) {
-          await sendNewMessage(ctx, error instanceof Error ? error.message : 'Не удалось разобрать слоты.');
+          await sendNewMessage(ctx, `${ui.error} ${error instanceof Error ? error.message : 'Не удалось разобрать слоты.'}`, createStepExtra('slots', draft));
           return;
         }
         break;
@@ -1376,30 +1901,30 @@ async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, 
         const accepted = parseBoolean(value);
         if (accepted === false) {
           flowStates.delete(key);
-          await sendNewMessage(ctx, 'Создание отменено.', rows([[button('Назад', 'org')]]));
+          await sendNewMessage(ctx, `${ui.cancel} Создание мероприятия отменено. Черновик удалён.`, rows([[button('Назад', 'org')]]));
           return;
         }
         if (accepted !== true) {
-          await sendNewMessage(ctx, 'Отправьте "да" для создания или "нет" для отмены.');
+          await sendNewMessage(ctx, `${ui.info} Отправьте "да", чтобы создать мероприятие, или "нет", чтобы отменить.`);
           return;
         }
         const input = buildEventInputFromDraft(draft);
         if (typeof input === 'string') {
           flowStates.delete(key);
-          await sendNewMessage(ctx, input, rows([[button('Создать заново', 'org:create')], [button('Назад', 'org')]]));
+          await sendNewMessage(ctx, `${ui.error} ${input}`, rows([[button('Создать заново', 'org:create')], [button('Назад', 'org')]]));
           return;
         }
         const university = await store.getUniversity(input.universityId);
         const event = await store.createEvent(input);
         flowStates.delete(key);
-        logger.info({ eventId: event.id, userId: user.id, universityId: event.universityId }, 'event created by flow');
-        await sendNewMessage(ctx, `Мероприятие создано:\n${formatEvent(event, event.capacity, university)}`, rows([[button('Открыть', `org:event:${event.id}`)], [button('Назад', 'org')]]));
+        logger.info(businessLog('event_created', { event_id: event.id, user_id: user.id, university_id: event.universityId, source: 'flow' }), 'event created by flow');
+        await sendNewMessage(ctx, `${ui.ok} Мероприятие создано:\n${formatEvent(event, event.capacity, university)}`, rows([[button('Открыть', `org:event:${event.id}`)], [button('Назад', 'org')]]));
         return;
       }
     }
   } catch (error) {
     logger.error({ err: error, userId: user.id }, 'create event flow failed');
-    await sendNewMessage(ctx, 'Не удалось обработать ответ. Попробуйте ещё раз или отмените создание.', rows([[button('Отмена', 'flow:cancel')]]));
+    await sendNewMessage(ctx, `${ui.error} Не удалось обработать ответ. Попробуйте ещё раз или отмените создание.`, rows([[button('Отмена', 'flow:cancel')]]));
     return;
   }
 
@@ -1407,11 +1932,300 @@ async function handleCreateEventFlow(ctx: AnyContext, state: Extract<FlowState, 
   flowStates.set(key, { kind: 'create_event', step: nextStep, draft });
 
   if (nextStep === 'confirm') {
-    await sendNewMessage(ctx, ['Проверьте мероприятие:', '', formatEventDraft(draft), '', createEventPrompt(nextStep)].join('\n'), rows([[button('Отмена', 'flow:cancel')]]));
+    await sendNewMessage(ctx, [`${ui.info} Проверьте мероприятие:`, '', formatEventDraft(draft), '', createEventPrompt(nextStep)].join('\n'), createStepExtra(nextStep, draft));
     return;
   }
 
-  await sendNewMessage(ctx, createEventPrompt(nextStep), rows([[button('Отмена', 'flow:cancel')]]));
+  if (nextStep === 'slots') {
+    await sendNewMessage(ctx, [createEventPrompt(nextStep), '', formatSlotBuilderText(draft.slots)].join('\n'), createStepExtra(nextStep, draft));
+    return;
+  }
+
+  await sendNewMessage(ctx, createEventPrompt(nextStep), createStepExtra(nextStep, draft));
+}
+
+async function applyCreateDateButton(ctx: AnyContext, rawValue: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'create_event' || state.step !== 'date') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас этот выбор не ожидается. Запустите создание заново или продолжите текущий шаг.`, rows([[button('Создать мероприятие', 'org:create')], [button('Назад', 'org')]]));
+    return;
+  }
+
+  const value = dateFromCompact(rawValue);
+
+  if (!value) {
+    await sendNewMessage(ctx, `${ui.error} Не удалось распознать выбранную дату. Попробуйте выбрать день ещё раз или введите дату вручную.`);
+    return;
+  }
+
+  await handleCreateEventFlow(ctx, state, value);
+}
+
+async function showCreateDateMonth(ctx: AnyContext, monthRaw: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'create_event' || state.step !== 'date') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас календарь не ожидается. Продолжите текущий шаг или начните создание заново.`, rows([[button('Создать мероприятие', 'org:create')], [button('Назад', 'org')]]));
+    return;
+  }
+
+  await sendNewMessage(ctx, createEventPrompt('date'), createDateKeyboard('create', monthRaw));
+}
+
+async function showCreateSlotHourPicker(ctx: AnyContext, rawValue: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'create_event' || state.step !== 'slots') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас конструктор слотов не ожидается. Продолжите текущий шаг или начните создание заново.`, rows([[button('Создать мероприятие', 'org:create')], [button('Назад', 'org')]]));
+    return;
+  }
+
+  if (rawValue === 'back') {
+    await sendNewMessage(ctx, formatSlotBuilderText(state.draft.slots), createSlotBuilderKeyboard('create', state.draft.slots?.length ?? 0));
+    return;
+  }
+
+  if (rawValue === 'start') {
+    await sendNewMessage(ctx, `${ui.time} Выберите час начала слота.`, createSlotHourKeyboard('create'));
+    return;
+  }
+
+  if (!parseClockTime(`${rawValue}:00`)) {
+    await sendNewMessage(ctx, `${ui.error} Час не распознан. Выберите час заново.`, createSlotHourKeyboard('create'));
+    return;
+  }
+
+  await sendNewMessage(ctx, `${ui.time} Выбран час ${rawValue}. Теперь выберите минуты начала слота.`, createSlotMinuteKeyboard('create', rawValue));
+}
+
+async function addCreateSlotFromButton(ctx: AnyContext, rawValue: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'create_event' || state.step !== 'slots') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас конструктор слотов не ожидается. Продолжите текущий шаг или начните создание заново.`, rows([[button('Создать мероприятие', 'org:create')], [button('Назад', 'org')]]));
+    return;
+  }
+
+  if (!state.draft.date || !state.draft.durationMinutes) {
+    await sendNewMessage(ctx, `${ui.warn} Для слотов нужна дата и длительность. Начните создание заново.`, rows([[button('Создать мероприятие', 'org:create')], [button('Назад', 'org')]]));
+    return;
+  }
+
+  const startTime = timeFromCompact(rawValue);
+  const slot = startTime ? createSlotFromStart(state.draft.date, startTime, state.draft.durationMinutes, state.draft.slots) : 'Время начала слота не распознано.';
+
+  if (typeof slot === 'string') {
+    await sendNewMessage(ctx, `${ui.error} ${slot}`, createSlotHourKeyboard('create'));
+    return;
+  }
+
+  const draft: EventDraft = {
+    ...state.draft,
+    slots: [...(state.draft.slots ?? []), slot].sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime())
+  };
+
+  flowStates.set(key, { ...state, draft });
+  await sendNewMessage(ctx, [`${ui.ok} Слот ${slot.label} добавлен.`, '', formatSlotBuilderText(draft.slots)].join('\n'), createSlotBuilderKeyboard('create', draft.slots?.length ?? 0));
+}
+
+async function clearCreateSlots(ctx: AnyContext): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'create_event' || state.step !== 'slots') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас конструктор слотов не ожидается.`, rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const draft: EventDraft = { ...state.draft, slots: [] };
+  flowStates.set(key, { ...state, draft });
+  await sendNewMessage(ctx, `${ui.cancel} Слоты очищены. Добавьте новые слоты кнопками.`, createSlotBuilderKeyboard('create', 0));
+}
+
+async function finishCreateSlots(ctx: AnyContext): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'create_event' || state.step !== 'slots') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас конструктор слотов не ожидается.`, rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  if (!state.draft.slots?.length) {
+    await sendNewMessage(ctx, `${ui.error} Добавьте хотя бы один слот. По первому слоту будет определено время начала мероприятия.`, createSlotBuilderKeyboard('create', 0));
+    return;
+  }
+
+  await handleCreateEventFlow(ctx, state, state.draft.slots.map((slot) => slot.label).join(', '));
+}
+
+async function applyEditDateButton(ctx: AnyContext, rawValue: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'edit_event' || state.step !== 'value' || state.field !== 'date') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас этот выбор не ожидается. Вернитесь в меню и выберите действие заново.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+    return;
+  }
+
+  const value = dateFromCompact(rawValue);
+
+  if (!value) {
+    await sendNewMessage(ctx, `${ui.error} Не удалось распознать выбранную дату. Попробуйте выбрать день ещё раз или введите дату вручную.`, editValueExtra('date'));
+    return;
+  }
+
+  await handleEditEventFlow(ctx, state, value);
+}
+
+async function showEditDateMonth(ctx: AnyContext, monthRaw: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'edit_event' || state.step !== 'value' || state.field !== 'date') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас календарь не ожидается. Вернитесь в меню и выберите действие заново.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+    return;
+  }
+
+  await sendNewMessage(ctx, editValuePrompt('date'), createDateKeyboard('edit', monthRaw));
+}
+
+async function showEditMinutePicker(ctx: AnyContext, hour: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'edit_event' || state.step !== 'value' || state.field !== 'time') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас выбор времени не ожидается. Вернитесь в меню и выберите действие заново.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+    return;
+  }
+
+  if (hour === 'back') {
+    await sendNewMessage(ctx, editValuePrompt('time'), createHourKeyboard('edit'));
+    return;
+  }
+
+  if (!parseClockTime(`${hour}:00`)) {
+    await sendNewMessage(ctx, `${ui.error} Час не распознан. Выберите час заново.`, createHourKeyboard('edit'));
+    return;
+  }
+
+  await sendNewMessage(ctx, `${ui.time} Выбран час ${hour}. Теперь выберите минуты.`, createMinuteKeyboard('edit', hour));
+}
+
+async function applyEditMinuteButton(ctx: AnyContext, rawValue: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'edit_event' || state.step !== 'value' || state.field !== 'time') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас выбор времени не ожидается. Вернитесь в меню и выберите действие заново.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+    return;
+  }
+
+  const value = timeFromCompact(rawValue);
+
+  if (!value || !parseClockTime(value)) {
+    await sendNewMessage(ctx, `${ui.error} Минуты не распознаны. Выберите время заново.`, createHourKeyboard('edit'));
+    return;
+  }
+
+  await handleEditEventFlow(ctx, state, value);
+}
+
+async function showEditSlotHourPicker(ctx: AnyContext, rawValue: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'edit_event' || state.step !== 'value' || state.field !== 'slots' || !state.eventId) {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас конструктор слотов не ожидается.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+    return;
+  }
+
+  if (rawValue === 'back') {
+    await sendNewMessage(ctx, formatSlotBuilderText(state.draftSlots), createSlotBuilderKeyboard('edit', state.draftSlots?.length ?? 0));
+    return;
+  }
+
+  if (rawValue === 'start') {
+    await sendNewMessage(ctx, `${ui.time} Выберите час начала слота.`, createSlotHourKeyboard('edit'));
+    return;
+  }
+
+  if (!parseClockTime(`${rawValue}:00`)) {
+    await sendNewMessage(ctx, `${ui.error} Час не распознан. Выберите час заново.`, createSlotHourKeyboard('edit'));
+    return;
+  }
+
+  await sendNewMessage(ctx, `${ui.time} Выбран час ${rawValue}. Теперь выберите минуты начала слота.`, createSlotMinuteKeyboard('edit', rawValue));
+}
+
+async function addEditSlotFromButton(ctx: AnyContext, rawValue: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'edit_event' || state.step !== 'value' || state.field !== 'slots' || !state.eventId) {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас конструктор слотов не ожидается.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+    return;
+  }
+
+  const event = await eventById(state.eventId);
+
+  if (!event) {
+    await sendNewMessage(ctx, `${ui.error} Мероприятие не найдено.`, rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const date = new Intl.DateTimeFormat('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    timeZone: 'Europe/Moscow'
+  }).format(new Date(event.startsAt));
+  const startTime = timeFromCompact(rawValue);
+  const slot = startTime ? createSlotFromStart(date, startTime, event.durationMinutes, state.draftSlots) : 'Время начала слота не распознано.';
+
+  if (typeof slot === 'string') {
+    await sendNewMessage(ctx, `${ui.error} ${slot}`, createSlotHourKeyboard('edit'));
+    return;
+  }
+
+  const draftSlots = [...(state.draftSlots ?? []), slot].sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime());
+  flowStates.set(key, { ...state, draftSlots });
+  await sendNewMessage(ctx, [`${ui.ok} Слот ${slot.label} добавлен.`, '', formatSlotBuilderText(draftSlots)].join('\n'), createSlotBuilderKeyboard('edit', draftSlots.length));
+}
+
+async function clearEditSlots(ctx: AnyContext): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'edit_event' || state.step !== 'value' || state.field !== 'slots') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас конструктор слотов не ожидается.`, rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  flowStates.set(key, { ...state, draftSlots: [] });
+  await sendNewMessage(ctx, `${ui.cancel} Слоты очищены. Добавьте новые слоты кнопками.`, createSlotBuilderKeyboard('edit', 0));
+}
+
+async function finishEditSlots(ctx: AnyContext): Promise<void> {
+  const key = userFlowKey(ctx);
+  const state = key ? flowStates.get(key) : undefined;
+
+  if (!key || !state || state.kind !== 'edit_event' || state.step !== 'value' || state.field !== 'slots') {
+    await sendNewMessage(ctx, `${ui.warn} Сейчас конструктор слотов не ожидается.`, rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  if (!state.draftSlots?.length) {
+    await sendNewMessage(ctx, `${ui.error} Добавьте хотя бы один слот.`, createSlotBuilderKeyboard('edit', 0));
+    return;
+  }
+
+  await handleEditEventFlow(ctx, state, state.draftSlots.map((slot) => slot.label).join(', '));
 }
 
 async function showOrganizerEvent(ctx: AnyContext, eventId: string) {
@@ -1419,7 +2233,7 @@ async function showOrganizerEvent(ctx: AnyContext, eventId: string) {
   const event = await eventById(eventId);
 
   if (!user || !event || (!canEditEvent(user, event) && !canDeleteEvent(user, event))) {
-    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.warn} Нет доступа к этому мероприятию.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
@@ -1453,12 +2267,12 @@ async function showEditEventHelp(ctx: AnyContext, eventId: string) {
   const event = await eventById(eventId);
 
   if (!user || !event || !canEditEvent(user, event)) {
-    await renderSingle(ctx, 'Изменение доступно только организатору или админу своего вуза, а также техадмину.', rows([[button('Назад', `org:event:${eventId}`)]]));
+    await renderSingle(ctx, `${ui.warn} Изменение доступно только организатору или админу своего вуза, а также техадмину.`, rows([[button('Назад', `org:event:${eventId}`)]]));
     return;
   }
 
   if (event.deletedAt) {
-    await renderSingle(ctx, 'Удаленное мероприятие сначала нужно восстановить.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    await renderSingle(ctx, `${ui.warn} Удалённое мероприятие сначала нужно восстановить.`, rows([[button('Назад', `org:event:${event.id}`)]]));
     return;
   }
 
@@ -1475,32 +2289,32 @@ async function updateEventFromOrganizerCommand(ctx: AnyContext, raw: string) {
   const parsed = parseEditEventInput(raw);
 
   if (typeof parsed === 'string') {
-    await renderSingle(ctx, [parsed, '', eventEditHelp()].join('\n'), rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, [`${ui.error} ${parsed}`, '', eventEditHelp()].join('\n'), rows([[button('Назад', 'org')]]));
     return;
   }
 
   const event = await eventById(parsed.eventId);
 
   if (!event || !canEditEvent(user, event)) {
-    await renderSingle(ctx, 'Мероприятие не найдено или нет доступа на изменение.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.error} Мероприятие не найдено или у вас нет доступа на изменение.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
   if (event.deletedAt) {
-    await renderSingle(ctx, 'Удаленное мероприятие сначала нужно восстановить.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    await renderSingle(ctx, `${ui.warn} Удалённое мероприятие сначала нужно восстановить.`, rows([[button('Назад', `org:event:${event.id}`)]]));
     return;
   }
 
   const updated = await store.updateEvent(event.id, parsed.patch);
 
   if (!updated) {
-    await renderSingle(ctx, 'Не удалось изменить мероприятие.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    await renderSingle(ctx, `${ui.error} Не удалось изменить мероприятие. Попробуйте ещё раз.`, rows([[button('Назад', `org:event:${event.id}`)]]));
     return;
   }
 
   const notified = await sendAutomaticEventChangeNotification(updated, changeNotificationKind(parsed.patch), parsed.label);
-  logger.info({ eventId: updated.id, userId: user.id, universityId: updated.universityId, notified }, 'event updated by organizer');
-  await renderSingle(ctx, `Мероприятие изменено: ${parsed.label}.\nУведомлений отправлено: ${notified}.`, rows([[button('Открыть', `org:event:${updated.id}`)], [button('Назад', 'org')]]));
+  logger.info(businessLog('event_updated', { event_id: updated.id, user_id: user.id, university_id: updated.universityId, notified, source: 'command', changed_label: parsed.label }), 'event updated by organizer');
+  await renderSingle(ctx, `${ui.ok} Мероприятие изменено: ${parsed.label}.\nУведомлений отправлено: ${notified}.`, rows([[button('Открыть', `org:event:${updated.id}`)], [button('Назад', 'org')]]));
 }
 
 async function startEditEventFlow(ctx: AnyContext, event?: EventCard): Promise<void> {
@@ -1512,23 +2326,23 @@ async function startEditEventFlow(ctx: AnyContext, event?: EventCard): Promise<v
   }
 
   if (event && !canEditEvent(user, event)) {
-    await sendNewMessage(ctx, 'Нет доступа к изменению этого мероприятия.', rows([[button('Назад', 'org')]]));
+    await sendNewMessage(ctx, `${ui.warn} Нет доступа к изменению этого мероприятия.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
   if (event?.deletedAt) {
-    await sendNewMessage(ctx, 'Удаленное мероприятие сначала нужно восстановить.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    await sendNewMessage(ctx, `${ui.warn} Удалённое мероприятие сначала нужно восстановить.`, rows([[button('Назад', `org:event:${event.id}`)]]));
     return;
   }
 
   if (event) {
     flowStates.set(key, { kind: 'edit_event', step: 'field', eventId: event.id });
-    await sendNewMessage(ctx, `Что изменить в мероприятии "${event.title}"?`, eventFieldKeyboard(event.id));
+    await sendNewMessage(ctx, `${ui.info} Что изменить в мероприятии "${event.title}"?`, eventFieldKeyboard(event.id));
     return;
   }
 
   flowStates.set(key, { kind: 'edit_event', step: 'eventId' });
-  await sendNewMessage(ctx, 'Введите id мероприятия, которое нужно изменить.', rows([[button('Отмена', 'flow:cancel')]]));
+  await sendNewMessage(ctx, `${ui.info} Введите id мероприятия, которое нужно изменить. Его можно открыть из меню организатора.`, rows([[button('Отмена', 'flow:cancel')]]));
 }
 
 async function selectEditField(ctx: AnyContext, eventId: string, field: EditableEventField): Promise<void> {
@@ -1537,12 +2351,24 @@ async function selectEditField(ctx: AnyContext, eventId: string, field: Editable
   const event = await eventById(eventId);
 
   if (!key || !user || !event || !canEditEvent(user, event)) {
-    await sendNewMessage(ctx, 'Мероприятие не найдено или нет доступа.', rows([[button('Назад', 'org')]]));
+    await sendNewMessage(ctx, `${ui.error} Мероприятие не найдено или у вас нет доступа.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
-  flowStates.set(key, { kind: 'edit_event', step: 'value', eventId, field });
-  await sendNewMessage(ctx, editValuePrompt(field), rows([[button('Отмена', 'flow:cancel')]]));
+  flowStates.set(key, {
+    kind: 'edit_event',
+    step: 'value',
+    eventId,
+    field,
+    draftSlots: field === 'slots' ? [...event.slots] : undefined
+  });
+
+  if (field === 'slots') {
+    await sendNewMessage(ctx, [editValuePrompt(field), '', formatSlotBuilderText(event.slots)].join('\n'), createSlotBuilderKeyboard('edit', event.slots.length));
+    return;
+  }
+
+  await sendNewMessage(ctx, editValuePrompt(field), editValueExtra(field));
 }
 
 async function handleEditEventFlow(ctx: AnyContext, state: Extract<FlowState, { kind: 'edit_event' }>, text: string): Promise<void> {
@@ -1557,28 +2383,28 @@ async function handleEditEventFlow(ctx: AnyContext, state: Extract<FlowState, { 
     const event = await eventById(text.trim());
 
     if (!event || !canEditEvent(user, event)) {
-      await sendNewMessage(ctx, 'Мероприятие не найдено или нет доступа. Введите другой id или отмените действие.', rows([[button('Отмена', 'flow:cancel')]]));
+      await sendNewMessage(ctx, `${ui.error} Мероприятие не найдено или у вас нет доступа. Введите другой id или отмените действие.`, rows([[button('Отмена', 'flow:cancel')]]));
       return;
     }
 
     if (event.deletedAt) {
-      await sendNewMessage(ctx, 'Удаленное мероприятие сначала нужно восстановить.', rows([[button('Назад', `org:event:${event.id}`)], [button('Отмена', 'flow:cancel')]]));
+      await sendNewMessage(ctx, `${ui.warn} Удалённое мероприятие сначала нужно восстановить.`, rows([[button('Назад', `org:event:${event.id}`)], [button('Отмена', 'flow:cancel')]]));
       return;
     }
 
     flowStates.set(key, { kind: 'edit_event', step: 'field', eventId: event.id });
-    await sendNewMessage(ctx, `Что изменить в мероприятии "${event.title}"?`, eventFieldKeyboard(event.id));
+    await sendNewMessage(ctx, `${ui.info} Что изменить в мероприятии "${event.title}"?`, eventFieldKeyboard(event.id));
     return;
   }
 
   if (state.step === 'field') {
-    await sendNewMessage(ctx, 'Выберите поле кнопкой ниже.', state.eventId ? eventFieldKeyboard(state.eventId) : rows([[button('Отмена', 'flow:cancel')]]));
+    await sendNewMessage(ctx, `${ui.info} Выберите поле кнопкой ниже.`, state.eventId ? eventFieldKeyboard(state.eventId) : rows([[button('Отмена', 'flow:cancel')]]));
     return;
   }
 
   if (!state.eventId || !state.field) {
     flowStates.delete(key);
-    await sendNewMessage(ctx, 'Сценарий изменения сброшен. Начните заново.', rows([[button('Назад', 'org')]]));
+    await sendNewMessage(ctx, `${ui.warn} Сценарий изменения сброшен. Начните заново.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
@@ -1586,14 +2412,14 @@ async function handleEditEventFlow(ctx: AnyContext, state: Extract<FlowState, { 
 
   if (!event || !canEditEvent(user, event)) {
     flowStates.delete(key);
-    await sendNewMessage(ctx, 'Мероприятие не найдено или нет доступа.', rows([[button('Назад', 'org')]]));
+    await sendNewMessage(ctx, `${ui.error} Мероприятие не найдено или у вас нет доступа.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
   const parsed = buildEditPatch(event, state.field, text);
 
   if (typeof parsed === 'string') {
-    await sendNewMessage(ctx, parsed, rows([[button('Отмена', 'flow:cancel')]]));
+    await sendNewMessage(ctx, `${ui.error} ${parsed}`, editValueExtra(state.field));
     return;
   }
 
@@ -1601,14 +2427,14 @@ async function handleEditEventFlow(ctx: AnyContext, state: Extract<FlowState, { 
 
   if (!updated) {
     flowStates.delete(key);
-    await sendNewMessage(ctx, 'Не удалось изменить мероприятие.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    await sendNewMessage(ctx, `${ui.error} Не удалось изменить мероприятие. Попробуйте ещё раз.`, rows([[button('Назад', `org:event:${event.id}`)]]));
     return;
   }
 
   const notified = await sendAutomaticEventChangeNotification(updated, changeNotificationKind(parsed.patch), parsed.label);
   flowStates.delete(key);
-  logger.info({ eventId: updated.id, userId: user.id, universityId: updated.universityId, notified }, 'event updated by flow');
-  await sendNewMessage(ctx, `Мероприятие изменено: ${parsed.label}.\nУведомлений поставлено в очередь: ${notified}.`, rows([[button('Открыть', `org:event:${updated.id}`)], [button('Назад', 'org')]]));
+  logger.info(businessLog('event_updated', { event_id: updated.id, user_id: user.id, university_id: updated.universityId, notified, source: 'flow', changed_label: parsed.label }), 'event updated by flow');
+  await sendNewMessage(ctx, `${ui.ok} Мероприятие изменено: ${parsed.label}.\nУведомлений поставлено в очередь: ${notified}.`, rows([[button('Открыть', `org:event:${updated.id}`)], [button('Назад', 'org')]]));
 }
 
 async function handleFlowMessage(ctx: AnyContext, text: string): Promise<boolean> {
@@ -1633,7 +2459,7 @@ async function confirmDeleteOrganizerEvent(ctx: AnyContext, eventId: string) {
   const event = await eventById(eventId);
 
   if (!user || !event || !canEditEvent(user, event)) {
-    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.warn} Нет доступа к этому мероприятию.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
@@ -1642,7 +2468,7 @@ async function confirmDeleteOrganizerEvent(ctx: AnyContext, eventId: string) {
   await renderSingle(
     ctx,
     [
-      `Удалить мероприятие "${event.title}"?`,
+      `${ui.warn} Удалить мероприятие "${event.title}"?`,
       `Активных записей: ${active}`,
       active > 0 ? 'Записи сохранятся. Мероприятие будет скрыто из каталога и помечено удаленным.' : 'Мероприятие будет скрыто из каталога и помечено удаленным.'
     ].join('\n'),
@@ -1658,19 +2484,19 @@ async function deleteOrganizerEvent(ctx: AnyContext, eventId: string) {
   const event = await eventById(eventId);
 
   if (!user || !event || !canDeleteEvent(user, event)) {
-    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.warn} Нет доступа к этому мероприятию.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
   const result = await store.deleteEvent(event.id);
 
   if (result === 'not_found') {
-    await renderSingle(ctx, 'Мероприятие уже удалено.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.info} Мероприятие уже удалено.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
-  logger.info({ eventId: event.id, userId: user.id, universityId: event.universityId }, 'event deleted by organizer');
-  await renderSingle(ctx, `Мероприятие "${event.title}" помечено удаленным. Записи участников сохранены.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+  logger.info(businessLog('event_deleted', { event_id: event.id, user_id: user.id, university_id: event.universityId }), 'event deleted by organizer');
+  await renderSingle(ctx, `${ui.cancel} Мероприятие "${event.title}" помечено удалённым. Записи участников сохранены.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
 }
 
 async function restoreOrganizerEvent(ctx: AnyContext, eventId: string) {
@@ -1678,42 +2504,50 @@ async function restoreOrganizerEvent(ctx: AnyContext, eventId: string) {
   const event = await eventById(eventId);
 
   if (!user || !event || !canDeleteEvent(user, event)) {
-    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.warn} Нет доступа к этому мероприятию.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
   const restored = await store.restoreEvent(event.id);
 
   if (!restored) {
-    await renderSingle(ctx, 'Мероприятие не найдено.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.error} Мероприятие не найдено.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
-  logger.info({ eventId: restored.id, userId: user.id, universityId: restored.universityId }, 'event restored by organizer');
-  await renderSingle(ctx, `Мероприятие "${restored.title}" восстановлено.`, rows([[button('Открыть', `org:event:${restored.id}`)], [button('Назад', 'org')]]));
+  logger.info(businessLog('event_restored', { event_id: restored.id, user_id: user.id, university_id: restored.universityId }), 'event restored by organizer');
+  await renderSingle(ctx, `${ui.ok} Мероприятие "${restored.title}" восстановлено.`, rows([[button('Открыть', `org:event:${restored.id}`)], [button('Назад', 'org')]]));
 }
 
-async function showOrganizerRegistrations(ctx: AnyContext, eventId: string) {
+async function showOrganizerRegistrations(ctx: AnyContext, eventId: string, pageRaw = 0) {
   const user = await requireConsent(ctx);
   const event = await eventById(eventId);
 
   if (!user || !event || !canManage(user, event)) {
-    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.warn} Нет доступа к этому мероприятию.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
   const registrations = await store.listRegistrations(event.id);
+  const page = clampPage(pageRaw, registrations.length);
 
   if (registrations.length === 0) {
-    await renderSingle(ctx, 'Записей пока нет.', rows([[button('Назад', `org:event:${event.id}`)]]));
+    await renderSingle(ctx, `${ui.info} Записей пока нет. Когда участники начнут записываться, они появятся здесь.`, rows([[button('Назад', `org:event:${event.id}`)]]));
     return;
   }
 
-  const lines = registrations.slice(0, 20).map((item) => {
+  const lines = pageSlice(registrations, page).map((item) => {
     return `${item.code} - ${item.userName} - ${statusLabels[item.status]} - ${slotLabel(event, item.slotId)}`;
   });
 
-  await renderSingle(ctx, ['Записи:', ...lines, '', 'Для карточки записи отправьте /find КОД'].join('\n'), rows([[button('Назад', `org:event:${event.id}`)]]));
+  await renderSingle(
+    ctx,
+    [`${ui.list} Записи:`, `Страница ${page + 1} из ${pageCount(registrations.length)}.`, ...lines, '', 'Для карточки записи отправьте /find КОД'].join('\n'),
+    rows([
+      ...(registrations.length > pageSize ? [paginationButtons(page, registrations.length, (nextPage) => `org:regs:${event.id}:${nextPage}`)] : []),
+      [button('Назад', `org:event:${event.id}`)]
+    ])
+  );
 }
 
 async function findRegistration(ctx: AnyContext, code: string) {
@@ -1722,7 +2556,7 @@ async function findRegistration(ctx: AnyContext, code: string) {
   const event = registration ? await eventById(registration.eventId) : undefined;
 
   if (!user || !registration || !event || !canEditEvent(user, event)) {
-    await renderSingle(ctx, 'Запись не найдена или нет доступа.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.error} Запись не найдена или у вас нет доступа.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
@@ -1750,12 +2584,23 @@ async function setOrganizerStatus(ctx: AnyContext, registrationId: string, statu
   const event = registration ? await eventById(registration.eventId) : undefined;
 
   if (!user || !registration || !event || !canEditEvent(user, event)) {
-    await renderSingle(ctx, 'Запись не найдена или нет доступа.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.error} Запись не найдена или у вас нет доступа.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
   const updated = await store.updateRegistration(registration.id, { status });
-  await renderSingle(ctx, `Статус записи ${updated?.code ?? registration.code}: ${statusLabels[status]}`, rows([[button('Назад', `org:event:${event.id}`)]]));
+  logger.info(
+    businessLog('registration_status_changed', {
+      registration_id: registration.id,
+      registration_code: updated?.code ?? registration.code,
+      event_id: event.id,
+      university_id: event.universityId,
+      actor_user_id: user.id,
+      status
+    }),
+    'registration status changed by organizer'
+  );
+  await renderSingle(ctx, `${ui.ok} Статус записи ${updated?.code ?? registration.code}: ${statusLabels[status]}`, rows([[button('Назад', `org:event:${event.id}`)]]));
 }
 
 async function showNotifyMenu(ctx: AnyContext, eventId: string) {
@@ -1763,13 +2608,13 @@ async function showNotifyMenu(ctx: AnyContext, eventId: string) {
   const event = await eventById(eventId);
 
   if (!user || !event || !canEditEvent(user, event)) {
-    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.warn} Нет доступа к этому мероприятию.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
   await renderSingle(
     ctx,
-    'Выберите тип уведомления. Оно уйдет только активным участникам этого мероприятия, у которых уведомления включены.',
+    `${ui.info} Выберите тип уведомления. Оно уйдёт только активным участникам этого мероприятия, у которых уведомления включены.`,
     rows([
       [button('За сутки', `org:send:${event.id}:day`)],
       [button('За час', `org:send:${event.id}:hour`)],
@@ -1786,7 +2631,7 @@ async function sendEventNotification(ctx: AnyContext, eventId: string, kind: key
   const event = await eventById(eventId);
 
   if (!user || !event || !canEditEvent(user, event)) {
-    await renderSingle(ctx, 'Нет доступа к этому мероприятию.', rows([[button('Назад', 'org')]]));
+    await renderSingle(ctx, `${ui.warn} Нет доступа к этому мероприятию.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
@@ -1801,7 +2646,17 @@ async function sendEventNotification(ctx: AnyContext, eventId: string, kind: key
     });
   }
 
-  await renderSingle(ctx, `Уведомление поставлено в очередь. Получателей: ${recipients.length}.`, rows([[button('Назад', `org:event:${event.id}`)]]));
+  logger.info(
+    businessLog('notification_requested', {
+      event_id: event.id,
+      university_id: event.universityId,
+      actor_user_id: user.id,
+      notification_kind: kind,
+      recipients: recipients.length
+    }),
+    'event notification requested'
+  );
+  await renderSingle(ctx, `${ui.ok} Уведомление поставлено в очередь. Получателей: ${recipients.length}.`, rows([[button('Назад', `org:event:${event.id}`)]]));
 }
 
 async function sendAutomaticEventChangeNotification(
@@ -1837,7 +2692,7 @@ async function requireRoleAdmin(ctx: AnyContext): Promise<StoredUser | undefined
   }
 
   if (user.role !== 'tech_admin' && user.role !== 'admin') {
-    await renderSingle(ctx, 'Это действие доступно только администратору.', rows([[button('Главное меню', 'menu')]]));
+    await renderSingle(ctx, `${ui.warn} Это действие доступно только администратору.`, rows([[button('Главное меню', 'menu')]]));
     return undefined;
   }
 
@@ -1854,7 +2709,7 @@ async function showAdminPanel(ctx: AnyContext) {
   await renderSingle(
     ctx,
     [
-      'Админ-панель',
+      `${ui.admin} Админ-панель`,
       '',
       user.role === 'tech_admin' ? 'Добавить админа: /admin_add MAX_ID university_id' : 'Админ может назначать организаторов только своего вуза.',
       user.role === 'tech_admin' ? 'Добавить организатора: /admin_org MAX_ID university_id' : 'Добавить организатора: /admin_org MAX_ID',
@@ -1875,7 +2730,7 @@ async function showAdminPanel(ctx: AnyContext) {
   );
 }
 
-async function showUsersByRole(ctx: AnyContext, role: Role) {
+async function showUsersByRole(ctx: AnyContext, role: Role, pageRaw = 0) {
   const user = await requireRoleAdmin(ctx);
 
   if (!user) {
@@ -1883,19 +2738,27 @@ async function showUsersByRole(ctx: AnyContext, role: Role) {
   }
 
   if (user.role !== 'tech_admin' && role !== 'organizer') {
-    await renderSingle(ctx, 'Админ вуза может смотреть здесь только организаторов своего вуза.', rows([[button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.warn} Админ вуза может смотреть здесь только организаторов своего вуза.`, rows([[button('Назад', 'admin')]]));
     return;
   }
 
   const users = await store.listUsers(role, user.role === 'tech_admin' ? undefined : user.universityId);
+  const page = clampPage(pageRaw, users.length);
 
   if (users.length === 0) {
-    await renderSingle(ctx, `Пользователей с ролью "${roleLabels[role]}" пока нет.`, rows([[button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.info} Пользователей с ролью "${roleLabels[role]}" пока нет.`, rows([[button('Назад', 'admin')]]));
     return;
   }
 
-  const lines = users.slice(0, 30).map((item) => formatUserLine(item));
-  await renderSingle(ctx, [`Роль: ${roleLabels[role]}`, ...lines].join('\n'), rows([[button('Назад', 'admin')]]));
+  const lines = pageSlice(users, page).map((item) => formatUserLine(item));
+  await renderSingle(
+    ctx,
+    [`${ui.list} Роль: ${roleLabels[role]}`, `Страница ${page + 1} из ${pageCount(users.length)}.`, ...lines].join('\n'),
+    rows([
+      ...(users.length > pageSize ? [paginationButtons(page, users.length, (nextPage) => `admin:list:${role}:${nextPage}`)] : []),
+      [button('Назад', 'admin')]
+    ])
+  );
 }
 
 async function showAdminUserCard(ctx: AnyContext, userIdRaw: string) {
@@ -1903,7 +2766,7 @@ async function showAdminUserCard(ctx: AnyContext, userIdRaw: string) {
   const targetId = parseUserId(userIdRaw);
 
   if (!user || !targetId) {
-    await renderSingle(ctx, 'Укажите MAX ID числом. Например: /admin_user 123456789', rows([[button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.error} Укажите MAX ID числом. Например: /admin_user 123456789`, rows([[button('Назад', 'admin')]]));
     return;
   }
 
@@ -1911,7 +2774,7 @@ async function showAdminUserCard(ctx: AnyContext, userIdRaw: string) {
   const canManageTarget = user.role === 'tech_admin' || target?.universityId === user.universityId || !target;
 
   if (!canManageTarget) {
-    await renderSingle(ctx, 'Нельзя управлять пользователем из другого вуза.', rows([[button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.warn} Нельзя управлять пользователем из другого вуза.`, rows([[button('Назад', 'admin')]]));
     return;
   }
 
@@ -1933,7 +2796,7 @@ async function showAdminUserCard(ctx: AnyContext, userIdRaw: string) {
     [
       target ? formatUserLine(target) : `MAX ID ${targetId}`,
       '',
-      target ? 'Выберите действие:' : 'Пользователь еще не писал боту, но роль можно назначить заранее.'
+      target ? `${ui.info} Выберите действие:` : `${ui.info} Пользователь ещё не писал боту, но роль можно назначить заранее.`
     ].join('\n'),
     rows(roleButtons)
   );
@@ -1944,29 +2807,38 @@ async function setRoleFromAdmin(ctx: AnyContext, userIdRaw: string, role: Role, 
   const targetId = parseUserId(userIdRaw);
 
   if (!user || !targetId) {
-    await renderSingle(ctx, 'Укажите MAX ID числом.', rows([[button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.error} Укажите MAX ID числом.`, rows([[button('Назад', 'admin')]]));
     return;
   }
 
   if (targetId === user.id && role !== 'tech_admin') {
-    await renderSingle(ctx, 'Нельзя снять технические права у самого себя через бота.', rows([[button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.warn} Нельзя снять технические права у самого себя через бота.`, rows([[button('Назад', 'admin')]]));
     return;
   }
 
   const universityId = normalizeUniversityId(universityIdRaw) ?? user.universityId;
 
   if (!canAssignRole(user, role, universityId)) {
-    await renderSingle(ctx, 'Недостаточно прав для назначения этой роли или вуза.', rows([[button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.warn} Недостаточно прав для назначения этой роли или вуза.`, rows([[button('Назад', 'admin')]]));
     return;
   }
 
   if ((role === 'admin' || role === 'organizer') && !universityId) {
-    await renderSingle(ctx, 'Для роли админа или организатора нужно указать вуз. Например: /admin_add 123 rtu-mirea', rows([[button('Список вузов', 'admin:universities')], [button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.info} Для роли админа или организатора нужно указать вуз. Например: /admin_add 123 rtu-mirea`, rows([[button('Список вузов', 'admin:universities')], [button('Назад', 'admin')]]));
     return;
   }
 
   const updated = await store.setUserRole(targetId, role, role === 'admin' || role === 'organizer' ? universityId : null);
-  await renderSingle(ctx, `Готово: ${formatUserLine(updated)}`, rows([[button('Назад', 'admin')]]));
+  logger.info(
+    businessLog('user_role_assigned', {
+      actor_user_id: user.id,
+      target_user_id: updated.id,
+      target_role: updated.role,
+      university_id: updated.universityId
+    }),
+    'user role assigned'
+  );
+  await renderSingle(ctx, `${ui.ok} Готово: ${formatUserLine(updated)}`, rows([[button('Назад', 'admin')]]));
 }
 
 async function changeUserUniversity(ctx: AnyContext, userIdRaw: string, universityIdRaw: string) {
@@ -1975,27 +2847,36 @@ async function changeUserUniversity(ctx: AnyContext, userIdRaw: string, universi
   const universityId = normalizeUniversityId(universityIdRaw);
 
   if (!user || !targetId || !universityId) {
-    await renderSingle(ctx, 'Формат: /admin_university MAX_ID university_id', rows([[button('Список вузов', 'admin:universities')], [button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.info} Формат команды: /admin_university MAX_ID university_id`, rows([[button('Список вузов', 'admin:universities')], [button('Назад', 'admin')]]));
     return;
   }
 
   const target = await store.getUser(targetId);
 
   if (!target || (target.role !== 'admin' && target.role !== 'organizer')) {
-    await renderSingle(ctx, 'Вуз можно менять только админам и организаторам.', rows([[button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.warn} Вуз можно менять только админам и организаторам.`, rows([[button('Назад', 'admin')]]));
     return;
   }
 
   if (!canAssignRole(user, target.role, universityId)) {
-    await renderSingle(ctx, 'Недостаточно прав для назначения этого вуза.', rows([[button('Назад', 'admin')]]));
+    await renderSingle(ctx, `${ui.warn} Недостаточно прав для назначения этого вуза.`, rows([[button('Назад', 'admin')]]));
     return;
   }
 
   const updated = await store.setUserRole(targetId, target.role, universityId);
-  await renderSingle(ctx, `Вуз обновлен: ${formatUserLine(updated)}`, rows([[button('Назад', 'admin')]]));
+  logger.info(
+    businessLog('user_university_changed', {
+      actor_user_id: user.id,
+      target_user_id: updated.id,
+      target_role: updated.role,
+      university_id: updated.universityId
+    }),
+    'user university changed'
+  );
+  await renderSingle(ctx, `${ui.ok} Вуз обновлён: ${formatUserLine(updated)}`, rows([[button('Назад', 'admin')]]));
 }
 
-async function showUniversitiesForAdmin(ctx: AnyContext) {
+async function showUniversitiesForAdmin(ctx: AnyContext, pageRaw = 0) {
   const user = await requireRoleAdmin(ctx);
 
   if (!user) {
@@ -2003,8 +2884,16 @@ async function showUniversitiesForAdmin(ctx: AnyContext) {
   }
 
   const universities = await store.listUniversities();
-  const lines = universities.map((university) => `${university.id} - ${university.shortTitle} - ${university.city}`);
-  await renderSingle(ctx, ['Вузы:', ...lines].join('\n'), rows([[button('Назад', 'admin')]]));
+  const page = clampPage(pageRaw, universities.length);
+  const lines = pageSlice(universities, page).map((university) => `${university.id} - ${university.shortTitle} - ${university.city}`);
+  await renderSingle(
+    ctx,
+    [`${ui.list} Вузы:`, `Страница ${page + 1} из ${pageCount(universities.length)}.`, ...lines].join('\n'),
+    rows([
+      ...(universities.length > pageSize ? [paginationButtons(page, universities.length, (nextPage) => `admin:universities:${nextPage}`)] : []),
+      [button('Назад', 'admin')]
+    ])
+  );
 }
 
 function canAssignRole(actor: StoredUser, role: Role, universityId?: string): boolean {
@@ -2108,7 +2997,7 @@ bot.command('admin', async (ctx) => {
 bot.command('whoami', async (ctx) => {
   logger.info(logContext(ctx), 'command whoami');
   const user = await rememberUser(ctx);
-  await ctx.reply(user ? `Ваш MAX ID: ${user.id}` : 'Не удалось определить MAX ID.');
+  await ctx.reply(user ? `${ui.info} Ваш MAX ID: ${user.id}` : `${ui.error} Не удалось определить MAX ID.`);
 });
 
 bot.hears(/^\/admin_add\s+(.+)/i, async (ctx) => {
@@ -2154,7 +3043,7 @@ bot.action(/.*/, async (ctx) => {
     const sender = getSender(ctx);
 
     if (!sender) {
-      await ctx.reply('Не удалось сохранить согласие.');
+      await ctx.reply(`${ui.error} Не удалось сохранить согласие. Откройте диалог с ботом напрямую и попробуйте ещё раз.`);
       return;
     }
 
@@ -2172,23 +3061,43 @@ bot.action(/.*/, async (ctx) => {
       }
     });
 
-    await ctx.reply('Согласие сохранено.');
+    await ctx.reply(`${ui.ok} Согласие сохранено.`);
     await showMainMenu(ctx, user);
     return;
   }
 
   if (payload === 'catalog') return showCatalog(ctx);
+  if (scope === 'catalog' && a === 'page') return showCatalog(ctx, undefined, parsePage(b));
+  if (scope === 'catalog' && a === 'uni') return showCatalog(ctx, b, parsePage(c));
   if (payload === 'menu') return showMainMenu(ctx);
+  if (payload === 'flow:noop') return;
   if (payload === 'universities') return showUniversities(ctx);
+  if (scope === 'universities' && a === 'page') return showUniversities(ctx, parsePage(b));
   if (payload === 'my') return showMyRegistrations(ctx);
+  if (scope === 'my' && a === 'page') return showMyRegistrations(ctx, parsePage(b));
   if (payload === 'org') return showOrganizerMenu(ctx);
+  if (scope === 'org' && a === 'page') return showOrganizerMenu(ctx, parsePage(b));
   if (scope === 'flow' && a === 'cancel') {
     const key = userFlowKey(ctx);
     if (key) {
       flowStates.delete(key);
     }
-    return sendNewMessage(ctx, 'Действие отменено.', rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
+    return sendNewMessage(ctx, `${ui.cancel} Действие отменено. Текущий сценарий закрыт.`, rows([[button('Назад', 'org')], [button('Главное меню', 'menu')]]));
   }
+  if (scope === 'flow' && a === 'create-date') return applyCreateDateButton(ctx, b);
+  if (scope === 'flow' && a === 'create-month') return showCreateDateMonth(ctx, b);
+  if (scope === 'flow' && a === 'create-slot-hour') return showCreateSlotHourPicker(ctx, b);
+  if (scope === 'flow' && a === 'create-slot-minute') return addCreateSlotFromButton(ctx, b);
+  if (scope === 'flow' && a === 'create-slot-clear') return clearCreateSlots(ctx);
+  if (scope === 'flow' && a === 'create-slot-finish') return finishCreateSlots(ctx);
+  if (scope === 'flow' && a === 'edit-date') return applyEditDateButton(ctx, b);
+  if (scope === 'flow' && a === 'edit-month') return showEditDateMonth(ctx, b);
+  if (scope === 'flow' && a === 'edit-hour') return showEditMinutePicker(ctx, b);
+  if (scope === 'flow' && a === 'edit-minute') return applyEditMinuteButton(ctx, b);
+  if (scope === 'flow' && a === 'edit-slot-hour') return showEditSlotHourPicker(ctx, b);
+  if (scope === 'flow' && a === 'edit-slot-minute') return addEditSlotFromButton(ctx, b);
+  if (scope === 'flow' && a === 'edit-slot-clear') return clearEditSlots(ctx);
+  if (scope === 'flow' && a === 'edit-slot-finish') return finishEditSlots(ctx);
   if (scope === 'flow' && a === 'edit-field') return selectEditField(ctx, b, c as EditableEventField);
   if (scope === 'org' && a === 'create') return showCreateEventHelp(ctx);
   if (payload === 'admin') return showAdminPanel(ctx);
@@ -2203,18 +3112,18 @@ bot.action(/.*/, async (ctx) => {
 
   if (scope === 'org' && a === 'event') return showOrganizerEvent(ctx, b);
   if (scope === 'org' && a === 'edit') return showEditEventHelp(ctx, b);
-  if (scope === 'org' && a === 'regs') return showOrganizerRegistrations(ctx, b);
+  if (scope === 'org' && a === 'regs') return showOrganizerRegistrations(ctx, b, parsePage(c));
   if (scope === 'org' && a === 'notify') return showNotifyMenu(ctx, b);
   if (scope === 'org' && a === 'delete') return confirmDeleteOrganizerEvent(ctx, b);
   if (scope === 'org' && a === 'delete-confirm') return deleteOrganizerEvent(ctx, b);
   if (scope === 'org' && a === 'restore') return restoreOrganizerEvent(ctx, b);
   if (scope === 'org' && a === 'status') return setOrganizerStatus(ctx, b, c as RegistrationStatus);
   if (scope === 'org' && a === 'send') return sendEventNotification(ctx, b, c as keyof typeof notificationTemplates);
-  if (scope === 'admin' && a === 'list') return showUsersByRole(ctx, b as Role);
-  if (scope === 'admin' && a === 'universities') return showUniversitiesForAdmin(ctx);
+  if (scope === 'admin' && a === 'list') return showUsersByRole(ctx, b as Role, parsePage(c));
+  if (scope === 'admin' && a === 'universities') return showUniversitiesForAdmin(ctx, parsePage(b));
   if (scope === 'admin' && a === 'role') return setRoleFromAdmin(ctx, b, c as Role, d);
 
-  await ctx.reply('Неизвестное действие. Откройте /start.');
+  await ctx.reply(`${ui.warn} Неизвестное действие. Откройте /start и выберите пункт из меню.`);
 });
 
 bot.on('message_created', async (ctx) => {

@@ -12,21 +12,144 @@ const app = Fastify({
   logger: {
     level: process.env.LOG_LEVEL ?? 'info',
     base: {
-      service: 'data-service'
+      service: 'data-service',
+      log_type: 'technical'
     }
   }
 });
 
+function businessLog(event: string, fields: Record<string, unknown>): Record<string, unknown> {
+  return {
+    log_type: 'business',
+    event,
+    ...fields
+  };
+}
+
 app.setErrorHandler((error, _request, reply) => {
-  const fastifyError = error as { statusCode?: number; code?: string };
+  const fastifyError = error as { statusCode?: number; code?: string; message?: string };
 
   app.log.error(error);
-  reply.status(fastifyError.statusCode ?? 500).send({ error: fastifyError.code ?? 'internal_error' });
+  reply.status(fastifyError.statusCode ?? 500).send({
+    error: fastifyError.code ?? 'internal_error',
+    message: fastifyError.statusCode === 400 ? fastifyError.message : undefined
+  });
 });
 
 app.get('/health', async () => {
   return { ok: true };
 });
+
+function validationError(message: string): Error & { statusCode: number; code: string } {
+  return Object.assign(new Error(message), {
+    statusCode: 400,
+    code: 'validation_error'
+  });
+}
+
+function assertPositiveInteger(value: unknown, field: string): void {
+  if (!Number.isInteger(value) || Number(value) <= 0) {
+    throw validationError(`${field} must be a positive integer`);
+  }
+}
+
+function assertIsoDate(value: unknown, field: string): void {
+  if (typeof value !== 'string' || Number.isNaN(new Date(value).getTime())) {
+    throw validationError(`${field} must be a valid date`);
+  }
+}
+
+function minutesOfDay(hour: string, minute: string): number {
+  return Number(hour) * 60 + Number(minute);
+}
+
+function slotInterval(label: string): { start: number; end: number } | undefined {
+  const match = label.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  return {
+    start: minutesOfDay(match[1], match[2]),
+    end: minutesOfDay(match[3], match[4])
+  };
+}
+
+function assertSlots(slots: CreateEventInput['slots']): void {
+  for (const slot of slots ?? []) {
+    if (!slot.id || !slot.label) {
+      throw validationError('slot id and label are required');
+    }
+
+    const match = slot.label.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/);
+
+    if (!match) {
+      throw validationError(`slot "${slot.label}" must use HH:MM-HH:MM format`);
+    }
+
+    const [, startHour, startMinute, endHour, endMinute] = match;
+    const numbers = [startHour, startMinute, endHour, endMinute].map(Number);
+    const [sh, sm, eh, em] = numbers;
+
+    if (sh > 23 || eh > 23 || sm > 59 || em > 59) {
+      throw validationError(`slot "${slot.label}" has invalid hours or minutes`);
+    }
+
+    if (minutesOfDay(endHour, endMinute) <= minutesOfDay(startHour, startMinute)) {
+      throw validationError(`slot "${slot.label}" must end after it starts`);
+    }
+
+    assertIsoDate(slot.startsAt, 'slot.startsAt');
+  }
+
+  const normalized = slots ?? [];
+
+  for (let left = 0; left < normalized.length; left += 1) {
+    for (let right = left + 1; right < normalized.length; right += 1) {
+      const leftInterval = slotInterval(normalized[left].label);
+      const rightInterval = slotInterval(normalized[right].label);
+
+      if (leftInterval && rightInterval && leftInterval.start < rightInterval.end && rightInterval.start < leftInterval.end) {
+        throw validationError(`slots "${normalized[left].label}" and "${normalized[right].label}" overlap`);
+      }
+    }
+  }
+}
+
+// DataService is the last line of defense for data quality: clients may be bots,
+// admin panels or future integrations, so the database-facing API validates the
+// same business limits that the MAX dialog validates for humans.
+function assertEventInput(input: CreateEventInput | UpdateEventInput, partial = false): void {
+  const requiredFields: (keyof CreateEventInput)[] = [
+    'universityId',
+    'title',
+    'startsAt',
+    'durationMinutes',
+    'format',
+    'capacity',
+    'description',
+    'requirements',
+    'locationOrUrl',
+    'cancelPolicy'
+  ];
+
+  if (!partial) {
+    for (const field of requiredFields) {
+      if (input[field] === undefined || input[field] === null || input[field] === '') {
+        throw validationError(`${field} is required`);
+      }
+    }
+  }
+
+  if (input.startsAt !== undefined) assertIsoDate(input.startsAt, 'startsAt');
+  if (input.durationMinutes !== undefined) assertPositiveInteger(input.durationMinutes, 'durationMinutes');
+  if (input.capacity !== undefined) assertPositiveInteger(input.capacity, 'capacity');
+  if (input.format !== undefined && input.format !== 'online' && input.format !== 'offline') {
+    throw validationError('format must be online or offline');
+  }
+  if (input.slots !== undefined) assertSlots(input.slots);
+}
 
 app.get('/universities', async () => {
   return store.listUniversities();
@@ -61,19 +184,21 @@ app.get<{ Params: { eventId: string } }>('/events/:eventId', async (request, rep
 });
 
 app.post<{ Body: CreateEventInput }>('/events', async (request, reply) => {
+  assertEventInput(request.body);
   const event = await store.createEvent(request.body);
-  app.log.info({ eventId: event.id, universityId: event.universityId }, 'event created');
+  app.log.info(businessLog('event_created', { event_id: event.id, university_id: event.universityId }), 'event created');
   return reply.status(201).send(event);
 });
 
 app.patch<{ Params: { eventId: string }; Body: UpdateEventInput }>('/events/:eventId', async (request, reply) => {
+  assertEventInput(request.body, true);
   const event = await store.updateEvent(request.params.eventId, request.body);
 
   if (!event) {
     return reply.status(404).send({ error: 'not_found' });
   }
 
-  app.log.info({ eventId: event.id, universityId: event.universityId }, 'event updated');
+  app.log.info(businessLog('event_updated', { event_id: event.id, university_id: event.universityId, patch_fields: Object.keys(request.body) }), 'event updated');
   return event;
 });
 
@@ -84,7 +209,7 @@ app.delete<{ Params: { eventId: string } }>('/events/:eventId', async (request, 
     return reply.status(404).send({ error: result });
   }
 
-  app.log.info({ eventId: request.params.eventId }, 'event soft deleted');
+  app.log.info(businessLog('event_deleted', { event_id: request.params.eventId }), 'event soft deleted');
   return reply.status(204).send();
 });
 
@@ -95,7 +220,7 @@ app.post<{ Params: { eventId: string } }>('/events/:eventId/restore', async (req
     return reply.status(404).send({ error: 'not_found' });
   }
 
-  app.log.info({ eventId: event.id, universityId: event.universityId }, 'event restored');
+  app.log.info(businessLog('event_restored', { event_id: event.id, university_id: event.universityId }), 'event restored');
   return event;
 });
 
@@ -124,7 +249,9 @@ app.post<{ Body: Omit<StoredUser, 'updatedAt'> }>('/users/upsert', async (reques
 app.patch<{ Params: { userId: string }; Body: { role: Role; universityId?: string | null } }>(
   '/users/:userId/role',
   async (request) => {
-    return store.setUserRole(Number(request.params.userId), request.body.role, request.body.universityId);
+    const user = await store.setUserRole(Number(request.params.userId), request.body.role, request.body.universityId);
+    app.log.info(businessLog('user_role_saved', { target_user_id: user.id, target_role: user.role, university_id: user.universityId }), 'user role saved');
+    return user;
   }
 );
 
@@ -135,6 +262,16 @@ app.get<{ Querystring: { eventId?: string; userId?: string } }>('/registrations'
 
 app.post<{ Body: Registration }>('/registrations', async (request, reply) => {
   await store.createRegistration(request.body);
+  app.log.info(
+    businessLog('registration_created', {
+      registration_id: request.body.id,
+      registration_code: request.body.code,
+      event_id: request.body.eventId,
+      user_id: request.body.userId,
+      slot_id: request.body.slotId
+    }),
+    'registration created'
+  );
   return reply.status(201).send(request.body);
 });
 
@@ -147,6 +284,18 @@ app.patch<{ Params: { registrationId: string }; Body: Partial<Registration> }>(
       return reply.status(404).send({ error: 'not_found' });
     }
 
+    app.log.info(
+      businessLog('registration_updated', {
+        registration_id: updated.id,
+        registration_code: updated.code,
+        event_id: updated.eventId,
+        user_id: updated.userId,
+        status: updated.status,
+        notifications_enabled: updated.notificationsEnabled,
+        patch_fields: Object.keys(request.body)
+      }),
+      'registration updated'
+    );
     return updated;
   }
 );

@@ -10,7 +10,8 @@ const app = Fastify({
   logger: {
     level: process.env.LOG_LEVEL ?? 'info',
     base: {
-      service: 'api-gateway'
+      service: 'api-gateway',
+      log_type: 'technical'
     }
   }
 });
@@ -37,6 +38,8 @@ app.get('/health', async () => {
   };
 });
 
+// Gateway держит внешний контракт единым: клиенты не знают внутренние адреса
+// data-service и task-service, поэтому позже сюда удобно добавить auth/rate limit.
 app.all('/tasks/*', async (request, reply) => {
   return proxy(request, reply, taskServiceUrl, request.url.replace(/^\/tasks/, ''));
 });

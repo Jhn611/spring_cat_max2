@@ -455,6 +455,8 @@ export class DatabaseStore {
   }
 
   private async migrate(): Promise<void> {
+    // Схема создаётся в нормализованном виде. Старый JSON-формат событий больше
+    // не поддерживаем: данные живут в events и event_slots, а legacy-колонка удаляется.
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS universities (
         id TEXT PRIMARY KEY,
