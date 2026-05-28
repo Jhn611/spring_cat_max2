@@ -28,5 +28,6 @@ RUN npm config set fetch-retries 5 \
   && npm ci --omit=dev
 
 COPY --from=build /app/dist ./dist
+COPY drizzle ./drizzle
 
 CMD ["node", "dist/bot/index.js"]

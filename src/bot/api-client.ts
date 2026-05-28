@@ -10,7 +10,7 @@ import type {
   University
 } from '../shared/types.js';
 
-export class DataServiceClient {
+export class ApiClient {
   constructor(private readonly baseUrl: string) {}
 
   listUniversities(): Promise<University[]> {
@@ -138,7 +138,7 @@ export class DataServiceClient {
   private async parse<T>(response: Response): Promise<T> {
     if (!response.ok) {
       const message = await response.text();
-      throw new Error(`Data service error ${response.status}: ${message}`);
+      throw new Error(`API gateway error ${response.status}: ${message}`);
     }
 
     if (response.status === 204) {

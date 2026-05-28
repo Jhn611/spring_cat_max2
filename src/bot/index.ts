@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
 import { Bot, Keyboard, type Context } from '@maxhub/max-bot-api';
-import { DataServiceClient } from './data-service-client.js';
+import { ApiClient } from './api-client.js';
 import { logger } from './logger.js';
 import { isActiveStatus } from '../shared/domain.js';
 import type {
@@ -24,7 +24,7 @@ if (!token) {
 }
 
 const bot = new Bot(token);
-const store = new DataServiceClient(process.env.API_GATEWAY_URL ?? process.env.DATA_SERVICE_URL ?? 'http://localhost:3050');
+const store = new ApiClient(process.env.API_GATEWAY_URL ?? process.env.DATA_SERVICE_URL ?? 'http://localhost:3050');
 const legalDocVersion = process.env.LEGAL_DOC_VERSION ?? 'hackathon-2026-05-14';
 const adminIds = parseIdSet(process.env.ADMIN_MAX_IDS);
 const techAdminIds = parseIdSet(process.env.TECH_ADMIN_MAX_IDS ?? process.env.MAIN_ADMIN_MAX_IDS);

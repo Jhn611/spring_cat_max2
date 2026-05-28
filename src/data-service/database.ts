@@ -1,6 +1,7 @@
 import pg from 'pg';
-import { sql } from 'drizzle-orm';
+import { and, asc, desc, eq, isNull, sql, type SQL } from 'drizzle-orm';
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { isActiveStatus } from '../shared/domain.js';
 import * as schema from './schema.js';
 import type {
@@ -18,59 +19,11 @@ import type {
 
 const { Pool } = pg;
 
-type DbUserRow = {
-  id: string;
-  name: string;
-  username: string | null;
-  role: Role;
-  university_id: string | null;
-  consent_json: string | object | null;
-  updated_at: Date | string;
-};
-
-type DbRegistrationRow = {
-  id: string;
-  code: string;
-  event_id: string;
-  slot_id: string | null;
-  user_id: string;
-  user_name: string;
-  status: Registration['status'];
-  notifications_enabled: boolean;
-  created_at: Date | string;
-  updated_at: Date | string;
-};
-
-type DbEventRow = {
-  id: string;
-  university_id: string;
-  title: string;
-  starts_at: Date | string;
-  duration_minutes: number;
-  format: EventFormat;
-  capacity: number;
-  description: string;
-  requirements: string;
-  location_or_url: string;
-  cancel_policy: string;
-  registration_closed: boolean;
-  late_cancel_allowed: boolean;
-  deleted_at: Date | string | null;
-};
-
-type DbEventSlotRow = {
-  id: string;
-  label: string;
-  starts_at: Date | string;
-};
-
-type DbUniversityRow = {
-  id: string;
-  title: string;
-  short_title: string;
-  city: string;
-  description: string;
-};
+type DbUserRow = typeof schema.users.$inferSelect;
+type DbRegistrationRow = typeof schema.registrations.$inferSelect;
+type DbEventRow = typeof schema.events.$inferSelect;
+type DbEventSlotRow = typeof schema.eventSlots.$inferSelect;
+type DbUniversityRow = typeof schema.universities.$inferSelect;
 
 export class DatabaseStore {
   private readonly pool: pg.Pool;
@@ -83,7 +36,8 @@ export class DatabaseStore {
 
   async init(): Promise<void> {
     await this.db.execute(sql`SELECT 1`);
-    await this.migrate();
+    await migrate(this.db, { migrationsFolder: './drizzle' });
+    await this.fillEventDefaults();
   }
 
   async close(): Promise<void> {
@@ -91,73 +45,72 @@ export class DatabaseStore {
   }
 
   async listUniversities(): Promise<University[]> {
-    const { rows } = await this.pool.query<DbUniversityRow>('SELECT * FROM universities ORDER BY title');
+    const rows = await this.db.select().from(schema.universities).orderBy(asc(schema.universities.title));
     return rows.map((row) => this.mapUniversity(row));
   }
 
   async getUniversity(universityId: string): Promise<University | undefined> {
-    const { rows } = await this.pool.query<DbUniversityRow>('SELECT * FROM universities WHERE id = $1', [universityId]);
+    const rows = await this.db.select().from(schema.universities).where(eq(schema.universities.id, universityId)).limit(1);
     return rows[0] ? this.mapUniversity(rows[0]) : undefined;
   }
 
   async listEvents(universityId?: string, includeDeleted = false): Promise<EventCard[]> {
-    const clauses: string[] = [];
-    const params: string[] = [];
+    const filters: SQL[] = [];
 
     if (universityId) {
-      params.push(universityId);
-      clauses.push(`university_id = $${params.length}`);
+      filters.push(eq(schema.events.universityId, universityId));
     }
 
     if (!includeDeleted) {
-      clauses.push('deleted_at IS NULL');
+      filters.push(isNull(schema.events.deletedAt));
     }
 
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    const { rows } = await this.pool.query<DbEventRow>(`SELECT * FROM events ${where} ORDER BY starts_at`, params);
+    const rows =
+      filters.length > 0
+        ? await this.db.select().from(schema.events).where(and(...filters)).orderBy(asc(schema.events.startsAt))
+        : await this.db.select().from(schema.events).orderBy(asc(schema.events.startsAt));
+
     return Promise.all(rows.map((row) => this.mapEvent(row)));
   }
 
   async getEvent(eventId: string): Promise<EventCard | undefined> {
-    const { rows } = await this.pool.query<DbEventRow>('SELECT * FROM events WHERE id = $1', [eventId]);
+    const rows = await this.db.select().from(schema.events).where(eq(schema.events.id, eventId)).limit(1);
     return rows[0] ? this.mapEvent(rows[0]) : undefined;
   }
 
   async createEvent(input: CreateEventInput): Promise<EventCard> {
     const id = await this.nextEventId(input.title);
 
-    await this.pool.query(
-      [
-        'INSERT INTO events',
-        '(id, university_id, title, starts_at, duration_minutes, format, capacity, description, requirements, location_or_url, cancel_policy, registration_closed, late_cancel_allowed)',
-        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)'
-      ].join(' '),
-      [
+    await this.db.transaction(async (tx) => {
+      await tx.insert(schema.events).values({
         id,
-        input.universityId,
-        input.title,
-        input.startsAt,
-        input.durationMinutes,
-        input.format,
-        input.capacity,
-        input.description,
-        input.requirements,
-        input.locationOrUrl,
-        input.cancelPolicy,
-        input.registrationClosed ?? false,
-        input.lateCancelAllowed ?? false
-      ]
-    );
+        universityId: input.universityId,
+        title: input.title,
+        startsAt: toDate(input.startsAt),
+        durationMinutes: input.durationMinutes,
+        format: input.format,
+        capacity: input.capacity,
+        description: input.description,
+        requirements: input.requirements,
+        locationOrUrl: input.locationOrUrl,
+        cancelPolicy: input.cancelPolicy,
+        registrationClosed: input.registrationClosed ?? false,
+        lateCancelAllowed: input.lateCancelAllowed ?? false
+      });
 
-    for (const slot of input.slots ?? []) {
-      await this.pool.query(
-        [
-          'INSERT INTO event_slots (event_id, id, label, starts_at)',
-          'VALUES ($1, $2, $3, $4)'
-        ].join(' '),
-        [id, slot.id, slot.label, slot.startsAt]
+      if (!input.slots?.length) {
+        return;
+      }
+
+      await tx.insert(schema.eventSlots).values(
+        input.slots.map((slot) => ({
+          eventId: id,
+          id: slot.id,
+          label: slot.label,
+          startsAt: toDate(slot.startsAt)
+        }))
       );
-    }
+    });
 
     const event = await this.getEvent(id);
 
@@ -176,43 +129,44 @@ export class DatabaseStore {
     }
 
     const next: EventCard = { ...current, ...patch };
-    await this.pool.query(
-      [
-        'UPDATE events SET',
-        'university_id = $1, title = $2, starts_at = $3, duration_minutes = $4, format = $5, capacity = $6,',
-        'description = $7, requirements = $8, location_or_url = $9, cancel_policy = $10, registration_closed = $11, late_cancel_allowed = $12',
-        'WHERE id = $13'
-      ].join(' '),
-      [
-        next.universityId,
-        next.title,
-        next.startsAt,
-        next.durationMinutes,
-        next.format,
-        next.capacity,
-        next.description,
-        next.requirements,
-        next.locationOrUrl,
-        next.cancelPolicy,
-        next.registrationClosed,
-        next.lateCancelAllowed,
-        eventId
-      ]
-    );
+    await this.db.transaction(async (tx) => {
+      await tx
+        .update(schema.events)
+        .set({
+          universityId: next.universityId,
+          title: next.title,
+          startsAt: toDate(next.startsAt),
+          durationMinutes: next.durationMinutes,
+          format: next.format,
+          capacity: next.capacity,
+          description: next.description,
+          requirements: next.requirements,
+          locationOrUrl: next.locationOrUrl,
+          cancelPolicy: next.cancelPolicy,
+          registrationClosed: next.registrationClosed,
+          lateCancelAllowed: next.lateCancelAllowed
+        })
+        .where(eq(schema.events.id, eventId));
 
-    if (patch.slots) {
-      await this.pool.query('DELETE FROM event_slots WHERE event_id = $1', [eventId]);
-
-      for (const slot of patch.slots) {
-        await this.pool.query(
-          [
-            'INSERT INTO event_slots (event_id, id, label, starts_at)',
-            'VALUES ($1, $2, $3, $4)'
-          ].join(' '),
-          [eventId, slot.id, slot.label, slot.startsAt]
-        );
+      if (!patch.slots) {
+        return;
       }
-    }
+
+      await tx.delete(schema.eventSlots).where(eq(schema.eventSlots.eventId, eventId));
+
+      if (!patch.slots.length) {
+        return;
+      }
+
+      await tx.insert(schema.eventSlots).values(
+        patch.slots.map((slot) => ({
+          eventId,
+          id: slot.id,
+          label: slot.label,
+          startsAt: toDate(slot.startsAt)
+        }))
+      );
+    });
 
     return this.getEvent(eventId);
   }
@@ -224,13 +178,16 @@ export class DatabaseStore {
       return 'not_found';
     }
 
-    await this.pool.query('UPDATE events SET deleted_at = COALESCE(deleted_at, NOW()) WHERE id = $1', [eventId]);
+    await this.db
+      .update(schema.events)
+      .set({ deletedAt: event.deletedAt ? toDate(event.deletedAt) : new Date() })
+      .where(eq(schema.events.id, eventId));
 
     return 'deleted';
   }
 
   async restoreEvent(eventId: string): Promise<EventCard | undefined> {
-    await this.pool.query('UPDATE events SET deleted_at = NULL WHERE id = $1', [eventId]);
+    await this.db.update(schema.events).set({ deletedAt: null }).where(eq(schema.events.id, eventId));
     return this.getEvent(eventId);
   }
 
@@ -250,21 +207,21 @@ export class DatabaseStore {
   }
 
   async listUsers(role?: Role, universityId?: string): Promise<StoredUser[]> {
-    const clauses: string[] = [];
-    const params: string[] = [];
+    const filters: SQL[] = [];
 
     if (role) {
-      params.push(role);
-      clauses.push(`role = $${params.length}`);
+      filters.push(eq(schema.users.role, role));
     }
 
     if (universityId) {
-      params.push(universityId);
-      clauses.push(`university_id = $${params.length}`);
+      filters.push(eq(schema.users.universityId, universityId));
     }
 
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    const { rows } = await this.pool.query<DbUserRow>(`SELECT * FROM users ${where} ORDER BY updated_at DESC`, params);
+    const rows =
+      filters.length > 0
+        ? await this.db.select().from(schema.users).where(and(...filters)).orderBy(desc(schema.users.updatedAt))
+        : await this.db.select().from(schema.users).orderBy(desc(schema.users.updatedAt));
+
     return rows.map((row) => this.mapUser(row));
   }
 
@@ -289,31 +246,39 @@ export class DatabaseStore {
       updatedAt: new Date().toISOString()
     };
 
-    await this.pool.query(
-      [
-        'INSERT INTO users (id, name, username, role, university_id, consent_json, updated_at)',
-        'VALUES ($1, $2, $3, $4, $5, $6, $7)',
-        'ON CONFLICT(id) DO UPDATE SET',
-        'name = EXCLUDED.name, username = EXCLUDED.username, role = EXCLUDED.role,',
-        "university_id = CASE WHEN EXCLUDED.role IN ('tech_admin', 'applicant') THEN NULL ELSE COALESCE(users.university_id, EXCLUDED.university_id) END,",
-        'consent_json = EXCLUDED.consent_json, updated_at = EXCLUDED.updated_at'
-      ].join(' '),
-      [
-        next.id,
-        next.name,
-        next.username ?? null,
-        next.role,
-        next.universityId ?? null,
-        next.consent ? JSON.stringify(next.consent) : null,
-        next.updatedAt
-      ]
-    );
+    await this.db
+      .insert(schema.users)
+      .values({
+        id: next.id,
+        name: next.name,
+        username: next.username ?? null,
+        role: next.role,
+        universityId: next.universityId ?? null,
+        consent: next.consent ?? null,
+        updatedAt: toDate(next.updatedAt)
+      })
+      .onConflictDoUpdate({
+        target: schema.users.id,
+        set: {
+          name: sql`excluded.name`,
+          username: sql`excluded.username`,
+          role: sql`excluded.role`,
+          universityId: sql`
+            CASE
+              WHEN excluded.role IN ('tech_admin', 'applicant') THEN NULL
+              ELSE COALESCE(${schema.users.universityId}, excluded.university_id)
+            END
+          `,
+          consent: sql`excluded.consent_json`,
+          updatedAt: sql`excluded.updated_at`
+        }
+      });
 
     return next;
   }
 
   async getUser(userId: number): Promise<StoredUser | undefined> {
-    const { rows } = await this.pool.query<DbUserRow>('SELECT * FROM users WHERE id = $1', [userId]);
+    const rows = await this.db.select().from(schema.users).where(eq(schema.users.id, userId)).limit(1);
     return rows[0] ? this.mapUser(rows[0]) : undefined;
   }
 
@@ -330,107 +295,102 @@ export class DatabaseStore {
       updatedAt: now
     };
 
-    await this.pool.query(
-      [
-        'INSERT INTO users (id, name, username, role, university_id, consent_json, updated_at)',
-        'VALUES ($1, $2, $3, $4, $5, $6, $7)',
-        'ON CONFLICT(id) DO UPDATE SET',
-        'role = EXCLUDED.role, university_id = EXCLUDED.university_id, updated_at = EXCLUDED.updated_at'
-      ].join(' '),
-      [
-        next.id,
-        next.name,
-        next.username ?? null,
-        next.role,
-        next.universityId ?? null,
-        next.consent ? JSON.stringify(next.consent) : null,
-        now
-      ]
-    );
+    await this.db
+      .insert(schema.users)
+      .values({
+        id: next.id,
+        name: next.name,
+        username: next.username ?? null,
+        role: next.role,
+        universityId: next.universityId ?? null,
+        consent: next.consent ?? null,
+        updatedAt: toDate(now)
+      })
+      .onConflictDoUpdate({
+        target: schema.users.id,
+        set: {
+          role: sql`excluded.role`,
+          universityId: sql`excluded.university_id`,
+          updatedAt: sql`excluded.updated_at`
+        }
+      });
 
     return next;
   }
 
   async createRegistration(registration: Registration): Promise<void> {
-    await this.pool.query(
-      [
-        'INSERT INTO registrations',
-        '(id, code, event_id, slot_id, user_id, user_name, status, notifications_enabled, created_at, updated_at)',
-        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)'
-      ].join(' '),
-      [
-        registration.id,
-        registration.code,
-        registration.eventId,
-        registration.slotId ?? null,
-        registration.userId,
-        registration.userName,
-        registration.status,
-        registration.notificationsEnabled,
-        registration.createdAt,
-        registration.updatedAt
-      ]
-    );
+    await this.db.insert(schema.registrations).values({
+      id: registration.id,
+      code: registration.code,
+      eventId: registration.eventId,
+      slotId: registration.slotId ?? null,
+      userId: registration.userId,
+      userName: registration.userName,
+      status: registration.status,
+      notificationsEnabled: registration.notificationsEnabled,
+      createdAt: toDate(registration.createdAt),
+      updatedAt: toDate(registration.updatedAt)
+    });
   }
 
   async updateRegistration(id: string, patch: Partial<Registration>): Promise<Registration | undefined> {
-    const current = (await this.listRegistrations()).find((item) => item.id === id);
+    const rows = await this.db.select().from(schema.registrations).where(eq(schema.registrations.id, id)).limit(1);
+    const current = rows[0] ? this.mapRegistration(rows[0]) : undefined;
 
     if (!current) {
       return undefined;
     }
 
     const next: Registration = { ...current, ...patch, updatedAt: new Date().toISOString() };
-    await this.pool.query(
-      [
-        'UPDATE registrations SET',
-        'code = $1, event_id = $2, slot_id = $3, user_id = $4, user_name = $5, status = $6,',
-        'notifications_enabled = $7, created_at = $8, updated_at = $9 WHERE id = $10'
-      ].join(' '),
-      [
-        next.code,
-        next.eventId,
-        next.slotId ?? null,
-        next.userId,
-        next.userName,
-        next.status,
-        next.notificationsEnabled,
-        next.createdAt,
-        next.updatedAt,
-        next.id
-      ]
-    );
+    await this.db
+      .update(schema.registrations)
+      .set({
+        code: next.code,
+        eventId: next.eventId,
+        slotId: next.slotId ?? null,
+        userId: next.userId,
+        userName: next.userName,
+        status: next.status,
+        notificationsEnabled: next.notificationsEnabled,
+        createdAt: toDate(next.createdAt),
+        updatedAt: toDate(next.updatedAt)
+      })
+      .where(eq(schema.registrations.id, next.id));
 
     return next;
   }
 
   async listRegistrations(eventId?: string, userId?: number): Promise<Registration[]> {
-    let query = 'SELECT * FROM registrations';
-    const clauses: string[] = [];
-    const params: Array<string | number> = [];
+    const filters: SQL[] = [];
 
     if (eventId) {
-      params.push(eventId);
-      clauses.push(`event_id = $${params.length}`);
+      filters.push(eq(schema.registrations.eventId, eventId));
     }
 
     if (userId !== undefined) {
-      params.push(userId);
-      clauses.push(`user_id = $${params.length}`);
+      filters.push(eq(schema.registrations.userId, userId));
     }
 
-    if (clauses.length > 0) {
-      query += ` WHERE ${clauses.join(' AND ')}`;
-    }
+    const rows =
+      filters.length > 0
+        ? await this.db
+            .select()
+            .from(schema.registrations)
+            .where(and(...filters))
+            .orderBy(desc(schema.registrations.createdAt))
+        : await this.db.select().from(schema.registrations).orderBy(desc(schema.registrations.createdAt));
 
-    query += ' ORDER BY created_at DESC';
-    const { rows } = await this.pool.query<DbRegistrationRow>(query, params);
     return rows.map((row) => this.mapRegistration(row));
   }
 
   async findRegistrationByCode(code: string): Promise<Registration | undefined> {
     const normalized = code.trim().toUpperCase();
-    const { rows } = await this.pool.query<DbRegistrationRow>('SELECT * FROM registrations WHERE code = $1', [normalized]);
+    const rows = await this.db
+      .select()
+      .from(schema.registrations)
+      .where(eq(schema.registrations.code, normalized))
+      .limit(1);
+
     return rows[0] ? this.mapRegistration(rows[0]) : undefined;
   }
 
@@ -444,9 +404,9 @@ export class DatabaseStore {
     for (let index = 0; index < 100; index += 1) {
       const suffix = index === 0 ? '' : `-${index + 1}`;
       const id = `${base}${suffix}`;
-      const { rows } = await this.pool.query<{ exists: boolean }>('SELECT EXISTS (SELECT 1 FROM events WHERE id = $1) AS exists', [id]);
+      const rows = await this.db.select({ id: schema.events.id }).from(schema.events).where(eq(schema.events.id, id)).limit(1);
 
-      if (!rows[0]?.exists) {
+      if (rows.length === 0) {
         return id;
       }
     }
@@ -454,177 +414,129 @@ export class DatabaseStore {
     return `${base}-${Date.now().toString(36)}`;
   }
 
-  private async migrate(): Promise<void> {
-    // Схема создаётся в нормализованном виде. Старый JSON-формат событий больше
-    // не поддерживаем: данные живут в events и event_slots, а legacy-колонка удаляется.
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS universities (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        short_title TEXT NOT NULL,
-        city TEXT NOT NULL,
-        description TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS users (
-        id BIGINT PRIMARY KEY,
-        name TEXT NOT NULL,
-        username TEXT,
-        role TEXT NOT NULL,
-        university_id TEXT,
-        consent_json JSONB,
-        updated_at TIMESTAMPTZ NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS events (
-        id TEXT PRIMARY KEY,
-        university_id TEXT NOT NULL,
-        title TEXT NOT NULL,
-        starts_at TIMESTAMPTZ NOT NULL,
-        duration_minutes INTEGER NOT NULL,
-        format TEXT NOT NULL,
-        capacity INTEGER NOT NULL,
-        description TEXT NOT NULL,
-        requirements TEXT NOT NULL,
-        location_or_url TEXT NOT NULL,
-        cancel_policy TEXT NOT NULL,
-        registration_closed BOOLEAN NOT NULL,
-        late_cancel_allowed BOOLEAN NOT NULL,
-        deleted_at TIMESTAMPTZ
-      );
-
-      CREATE TABLE IF NOT EXISTS event_slots (
-        event_id TEXT NOT NULL,
-        id TEXT NOT NULL,
-        label TEXT NOT NULL,
-        starts_at TIMESTAMPTZ NOT NULL,
-        PRIMARY KEY (event_id, id)
-      );
-
-      CREATE TABLE IF NOT EXISTS registrations (
-        id TEXT PRIMARY KEY,
-        code TEXT NOT NULL UNIQUE,
-        event_id TEXT NOT NULL,
-        slot_id TEXT,
-        user_id BIGINT NOT NULL,
-        user_name TEXT NOT NULL,
-        status TEXT NOT NULL,
-        notifications_enabled BOOLEAN NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL
-      );
-    `);
-
-    await this.pool.query(`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS university_id TEXT;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS university_id TEXT;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS title TEXT;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS duration_minutes INTEGER;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS format TEXT;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS capacity INTEGER;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS description TEXT;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS requirements TEXT;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS location_or_url TEXT;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS cancel_policy TEXT;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS registration_closed BOOLEAN;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS late_cancel_allowed BOOLEAN;
-      ALTER TABLE events ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-    `);
-
-    await this.pool.query('ALTER TABLE events DROP COLUMN IF EXISTS data_json');
-    await this.fillEventDefaults();
-
-    await this.pool.query(`
-      ALTER TABLE events ALTER COLUMN university_id SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN title SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN duration_minutes SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN format SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN capacity SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN description SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN requirements SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN location_or_url SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN cancel_policy SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN registration_closed SET NOT NULL;
-      ALTER TABLE events ALTER COLUMN late_cancel_allowed SET NOT NULL;
-
-      CREATE INDEX IF NOT EXISTS events_university_id_idx ON events(university_id);
-      CREATE INDEX IF NOT EXISTS events_deleted_at_idx ON events(deleted_at);
-      CREATE INDEX IF NOT EXISTS event_slots_event_id_idx ON event_slots(event_id);
-      CREATE INDEX IF NOT EXISTS users_role_idx ON users(role);
-      CREATE INDEX IF NOT EXISTS users_university_id_idx ON users(university_id);
-      CREATE INDEX IF NOT EXISTS registrations_event_id_idx ON registrations(event_id);
-      CREATE INDEX IF NOT EXISTS registrations_user_id_idx ON registrations(user_id);
-    `);
-  }
-
   private async fillEventDefaults(): Promise<void> {
-    await this.pool.query(`
-      INSERT INTO universities (id, title, short_title, city, description)
-      VALUES
-        ('rtu-mirea', 'Российский технологический университет МИРЭА', 'РТУ МИРЭА', 'Москва', 'Технологический университет с ИТ, инженерными и естественно-научными направлениями.'),
-        ('spring-demo', 'Весенний демонстрационный университет', 'Spring Demo University', 'Москва', 'Демо-вуз для проверки мультивузовой модели бота.')
-      ON CONFLICT(id) DO UPDATE SET
-        title = EXCLUDED.title,
-        short_title = EXCLUDED.short_title,
-        city = EXCLUDED.city,
-        description = EXCLUDED.description;
-    `);
+    await this.db
+      .insert(schema.universities)
+      .values([
+        {
+          id: 'rtu-mirea',
+          title: 'Российский технологический университет МИРЭА',
+          shortTitle: 'РТУ МИРЭА',
+          city: 'Москва',
+          description: 'Технологический университет с ИТ, инженерными и естественно-научными направлениями.'
+        },
+        {
+          id: 'spring-demo',
+          title: 'Весенний демонстрационный университет',
+          shortTitle: 'Spring Demo University',
+          city: 'Москва',
+          description: 'Демо-вуз для проверки мультивузовой модели бота.'
+        }
+      ])
+      .onConflictDoUpdate({
+        target: schema.universities.id,
+        set: {
+          title: sql`excluded.title`,
+          shortTitle: sql`excluded.short_title`,
+          city: sql`excluded.city`,
+          description: sql`excluded.description`
+        }
+      });
 
-    await this.pool.query(`
-      INSERT INTO events
-        (id, university_id, title, starts_at, duration_minutes, format, capacity, description, requirements, location_or_url, cancel_policy, registration_closed, late_cancel_allowed)
-      VALUES
-        ('open-day-it', 'rtu-mirea', 'День открытых дверей ИТ-направлений', '2026-05-28T15:00:00+03:00', 90, 'offline', 40, 'Встреча с приемной комиссией и кафедрами: программы, проходные баллы, проектное обучение и вопросы абитуриентов.', 'Возьмите документ, удостоверяющий личность. Для прохода достаточно кода записи.', 'Главный корпус, аудитория 214', 'Отмена доступна до начала мероприятия. Поздняя отмена запрещена.', FALSE, FALSE),
-        ('campus-tour', 'rtu-mirea', 'Экскурсия по кампусу', '2026-05-30T12:00:00+03:00', 60, 'offline', 25, 'Маршрут по учебным корпусам, лабораториям, библиотеке и пространствам для студенческих проектов.', 'Удобная обувь и подтверждение записи с кодом.', 'Сбор у центрального входа', 'Отмена доступна до начала мероприятия. Поздняя отмена помечается отдельно.', FALSE, TRUE),
-        ('online-consulting', 'spring-demo', 'Онлайн-консультация по поступлению', '2026-06-02T18:00:00+03:00', 45, 'online', 80, 'Короткая консультация о подаче документов, индивидуальных достижениях и сроках приемной кампании.', 'Стабильный интернет и возможность открыть ссылку на подключение.', 'Ссылка будет отправлена участникам за сутки до начала.', 'Отмена доступна до начала мероприятия.', FALSE, FALSE)
-      ON CONFLICT(id) DO NOTHING;
-    `);
+    await this.db
+      .insert(schema.events)
+      .values([
+        {
+          id: 'open-day-it',
+          universityId: 'rtu-mirea',
+          title: 'День открытых дверей ИТ-направлений',
+          startsAt: toDate('2026-05-28T15:00:00+03:00'),
+          durationMinutes: 90,
+          format: 'offline',
+          capacity: 40,
+          description:
+            'Встреча с приемной комиссией и кафедрами: программы, проходные баллы, проектное обучение и вопросы абитуриентов.',
+          requirements: 'Возьмите документ, удостоверяющий личность. Для прохода достаточно кода записи.',
+          locationOrUrl: 'Главный корпус, аудитория 214',
+          cancelPolicy: 'Отмена доступна до начала мероприятия. Поздняя отмена запрещена.',
+          registrationClosed: false,
+          lateCancelAllowed: false
+        },
+        {
+          id: 'campus-tour',
+          universityId: 'rtu-mirea',
+          title: 'Экскурсия по кампусу',
+          startsAt: toDate('2026-05-30T12:00:00+03:00'),
+          durationMinutes: 60,
+          format: 'offline',
+          capacity: 25,
+          description: 'Маршрут по учебным корпусам, лабораториям, библиотеке и пространствам для студенческих проектов.',
+          requirements: 'Удобная обувь и подтверждение записи с кодом.',
+          locationOrUrl: 'Сбор у центрального входа',
+          cancelPolicy: 'Отмена доступна до начала мероприятия. Поздняя отмена помечается отдельно.',
+          registrationClosed: false,
+          lateCancelAllowed: true
+        },
+        {
+          id: 'online-consulting',
+          universityId: 'spring-demo',
+          title: 'Онлайн-консультация по поступлению',
+          startsAt: toDate('2026-06-02T18:00:00+03:00'),
+          durationMinutes: 45,
+          format: 'online',
+          capacity: 80,
+          description: 'Короткая консультация о подаче документов, индивидуальных достижениях и сроках приемной кампании.',
+          requirements: 'Стабильный интернет и возможность открыть ссылку на подключение.',
+          locationOrUrl: 'Ссылка будет отправлена участникам за сутки до начала.',
+          cancelPolicy: 'Отмена доступна до начала мероприятия.',
+          registrationClosed: false,
+          lateCancelAllowed: false
+        }
+      ])
+      .onConflictDoNothing();
 
-    await this.pool.query(`
-      UPDATE events
-      SET
-        university_id = COALESCE(university_id, 'rtu-mirea'),
-        title = COALESCE(title, id),
-        duration_minutes = COALESCE(duration_minutes, 60),
-        format = COALESCE(format, 'offline'),
-        capacity = COALESCE(capacity, 1),
-        description = COALESCE(description, ''),
-        requirements = COALESCE(requirements, ''),
-        location_or_url = COALESCE(location_or_url, ''),
-        cancel_policy = COALESCE(cancel_policy, ''),
-        registration_closed = COALESCE(registration_closed, FALSE),
-        late_cancel_allowed = COALESCE(late_cancel_allowed, FALSE);
-    `);
+    await this.db
+      .update(schema.events)
+      .set({
+        universityId: sql`COALESCE(${schema.events.universityId}, 'rtu-mirea')`,
+        title: sql`COALESCE(${schema.events.title}, ${schema.events.id})`,
+        durationMinutes: sql`COALESCE(${schema.events.durationMinutes}, 60)`,
+        format: sql`COALESCE(${schema.events.format}, 'offline')`,
+        capacity: sql`COALESCE(${schema.events.capacity}, 1)`,
+        description: sql`COALESCE(${schema.events.description}, '')`,
+        requirements: sql`COALESCE(${schema.events.requirements}, '')`,
+        locationOrUrl: sql`COALESCE(${schema.events.locationOrUrl}, '')`,
+        cancelPolicy: sql`COALESCE(${schema.events.cancelPolicy}, '')`,
+        registrationClosed: sql`COALESCE(${schema.events.registrationClosed}, FALSE)`,
+        lateCancelAllowed: sql`COALESCE(${schema.events.lateCancelAllowed}, FALSE)`
+      });
 
-    await this.pool.query(`
-      INSERT INTO event_slots (event_id, id, label, starts_at)
-      VALUES
-        ('open-day-it', '15-00', '15:00-16:30', '2026-05-28T15:00:00+03:00'),
-        ('open-day-it', '17-00', '17:00-18:30', '2026-05-28T17:00:00+03:00')
-      ON CONFLICT(event_id, id) DO UPDATE SET
-        label = EXCLUDED.label,
-        starts_at = EXCLUDED.starts_at;
-    `);
+    await this.db
+      .insert(schema.eventSlots)
+      .values([
+        {
+          eventId: 'open-day-it',
+          id: '15-00',
+          label: '15:00-16:30',
+          startsAt: toDate('2026-05-28T15:00:00+03:00')
+        },
+        {
+          eventId: 'open-day-it',
+          id: '17-00',
+          label: '17:00-18:30',
+          startsAt: toDate('2026-05-28T17:00:00+03:00')
+        }
+      ])
+      .onConflictDoUpdate({
+        target: [schema.eventSlots.eventId, schema.eventSlots.id],
+        set: {
+          label: sql`excluded.label`,
+          startsAt: sql`excluded.starts_at`
+        }
+      });
   }
 
-  private async hasColumn(tableName: string, columnName: string): Promise<boolean> {
-    const { rows } = await this.pool.query<{ exists: boolean }>(
-      `
-        SELECT EXISTS (
-          SELECT 1
-          FROM information_schema.columns
-          WHERE table_schema = 'public'
-            AND table_name = $1
-            AND column_name = $2
-        ) AS exists
-      `,
-      [tableName, columnName]
-    );
-
-    return rows[0]?.exists ?? false;
-  }
-
-  private parseJson<T>(value: string | object | null): T | undefined {
+  private parseJson<T>(value: unknown): T | undefined {
     if (!value) {
       return undefined;
     }
@@ -633,44 +545,49 @@ export class DatabaseStore {
   }
 
   private async mapEvent(row: DbEventRow): Promise<EventCard> {
-    const { rows: slots } = await this.pool.query<DbEventSlotRow>(
-      'SELECT id, label, starts_at FROM event_slots WHERE event_id = $1 ORDER BY starts_at',
-      [row.id]
-    );
+    const slots = await this.db
+      .select()
+      .from(schema.eventSlots)
+      .where(eq(schema.eventSlots.eventId, row.id))
+      .orderBy(asc(schema.eventSlots.startsAt));
 
     return {
       id: row.id,
-      universityId: row.university_id,
+      universityId: row.universityId,
       title: row.title,
-      startsAt: new Date(row.starts_at).toISOString(),
-      durationMinutes: row.duration_minutes,
-      format: row.format,
+      startsAt: row.startsAt.toISOString(),
+      durationMinutes: row.durationMinutes,
+      format: row.format as EventFormat,
       capacity: row.capacity,
       organizerIds: [],
       description: row.description,
       requirements: row.requirements,
-      locationOrUrl: row.location_or_url,
-      cancelPolicy: row.cancel_policy,
-      registrationClosed: row.registration_closed,
-      lateCancelAllowed: row.late_cancel_allowed,
-      deletedAt: row.deleted_at ? new Date(row.deleted_at).toISOString() : undefined,
-      slots: slots.map((slot): EventSlot => ({
-        id: slot.id,
-        label: slot.label,
-        startsAt: new Date(slot.starts_at).toISOString()
-      }))
+      locationOrUrl: row.locationOrUrl,
+      cancelPolicy: row.cancelPolicy,
+      registrationClosed: row.registrationClosed,
+      lateCancelAllowed: row.lateCancelAllowed,
+      deletedAt: row.deletedAt ? row.deletedAt.toISOString() : undefined,
+      slots: slots.map((slot): EventSlot => this.mapSlot(slot))
+    };
+  }
+
+  private mapSlot(slot: DbEventSlotRow): EventSlot {
+    return {
+      id: slot.id,
+      label: slot.label,
+      startsAt: slot.startsAt.toISOString()
     };
   }
 
   private mapUser(row: DbUserRow): StoredUser {
     return {
-      id: Number(row.id),
+      id: row.id,
       name: row.name,
       username: row.username ?? undefined,
-      role: row.role,
-      universityId: row.university_id ?? undefined,
-      consent: this.parseJson(row.consent_json),
-      updatedAt: new Date(row.updated_at).toISOString()
+      role: row.role as Role,
+      universityId: row.universityId ?? undefined,
+      consent: this.parseJson(row.consent),
+      updatedAt: row.updatedAt.toISOString()
     };
   }
 
@@ -678,14 +595,14 @@ export class DatabaseStore {
     return {
       id: row.id,
       code: row.code,
-      eventId: row.event_id,
-      slotId: row.slot_id ?? undefined,
-      userId: Number(row.user_id),
-      userName: row.user_name,
-      status: row.status,
-      notificationsEnabled: row.notifications_enabled,
-      createdAt: new Date(row.created_at).toISOString(),
-      updatedAt: new Date(row.updated_at).toISOString()
+      eventId: row.eventId,
+      slotId: row.slotId ?? undefined,
+      userId: row.userId,
+      userName: row.userName,
+      status: row.status as Registration['status'],
+      notificationsEnabled: row.notificationsEnabled,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString()
     };
   }
 
@@ -693,11 +610,15 @@ export class DatabaseStore {
     return {
       id: row.id,
       title: row.title,
-      shortTitle: row.short_title,
+      shortTitle: row.shortTitle,
       city: row.city,
       description: row.description
     };
   }
+}
+
+function toDate(value: string | Date): Date {
+  return value instanceof Date ? value : new Date(value);
 }
 
 function slugify(value: string): string {
