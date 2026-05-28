@@ -29,6 +29,7 @@ const legalDocVersion = process.env.LEGAL_DOC_VERSION ?? 'hackathon-2026-05-14';
 const adminIds = parseIdSet(process.env.ADMIN_MAX_IDS);
 const techAdminIds = parseIdSet(process.env.TECH_ADMIN_MAX_IDS ?? process.env.MAIN_ADMIN_MAX_IDS);
 const bootstrapAdminUniversityId = process.env.ADMIN_UNIVERSITY_ID ?? process.env.DEFAULT_UNIVERSITY_ID;
+const adminSpaUrl = process.env.ADMIN_SPA_URL ?? 'http://localhost:3080';
 
 logger.info(
   {
@@ -78,6 +79,16 @@ type FlowState =
       eventId?: string;
       field?: EditableEventField;
       draftSlots?: EventSlot[];
+    }
+  | {
+      kind: 'registrar';
+      action: 'add' | 'remove';
+      eventId: string;
+    }
+  | {
+      kind: 'admin_role';
+      role: Role;
+      universityId?: string;
     };
 
 type CreateEventStep =
@@ -113,6 +124,7 @@ type EditableEventField =
   | 'slots';
 
 const flowStates = new Map<string, FlowState>();
+const pendingExternalLogins = new Map<number, string>();
 
 const statusLabels: Record<RegistrationStatus, string> = {
   confirmed: 'Подтверждена',
@@ -526,25 +538,82 @@ async function showMainMenu(ctx: AnyContext, user?: StoredUser) {
     return;
   }
 
+  const manageable = await store.listManageableEvents(current.id, current.role);
   const menu = [
     [button('Все мероприятия', 'catalog')],
     [button('Выбрать вуз', 'universities')],
     [button('Мои записи на мероприятия', 'my')]
   ];
 
-  if (current.role === 'organizer' || current.role === 'admin') {
-    menu.push([button('Мероприятия организатора', 'org')]);
-  }
-
-  if (current.role === 'tech_admin') {
-    menu.push([button('Мероприятия организатора', 'org')]);
+  if (manageable.length > 0 || current.role === 'organizer' || current.role === 'admin' || current.role === 'tech_admin') {
+    menu.push([button('Управление мероприятиями', 'org')]);
   }
 
   if (current.role === 'admin' || current.role === 'tech_admin') {
     menu.push([button('Админ-панель', 'admin')]);
   }
 
+  if (current.role === 'organizer' || current.role === 'admin' || current.role === 'tech_admin') {
+    menu.push([button('Веб-панель', 'web-panel', 'positive')]);
+  }
+
   await renderSingle(ctx, `${ui.info} Главное меню. Выберите, что хотите сделать.`, rows(menu));
+}
+
+async function showWebPanelInfo(ctx: AnyContext): Promise<void> {
+  const user = await requireConsent(ctx);
+
+  if (!user) {
+    return;
+  }
+
+  if (user.role !== 'organizer' && user.role !== 'admin' && user.role !== 'tech_admin') {
+    await renderSingle(ctx, `${ui.warn} Веб-панель доступна только организаторам, админам и техадминам.`, rows([[button('Главное меню', 'menu')]]));
+    return;
+  }
+
+  await renderSingle(
+    ctx,
+    [
+      `${ui.admin} Веб-панель управления:`,
+      adminSpaUrl,
+      '',
+      'Откройте ссылку, введите любой удобный логин, затем подтвердите вход кодом из MAX.',
+      'Если логин ещё не привязан, на странице появится QR и deeplink для привязки.'
+    ].join('\n'),
+    rows([[button('Главное меню', 'menu')]])
+  );
+}
+
+async function handleExternalLogin(ctx: AnyContext, loginRaw: string): Promise<void> {
+  const sender = getSender(ctx);
+  const login = normalizeExternalLogin(loginRaw);
+
+  if (!sender || !login) {
+    await ctx.reply(`${ui.error} Логин не распознан. Откройте ссылку входа ещё раз или введите /login ваш_логин.`);
+    return;
+  }
+
+  const user = await requireConsent(ctx);
+
+  if (!user) {
+    pendingExternalLogins.set(sender.user_id, login);
+    await ctx.reply(`${ui.info} После согласия я отправлю код входа для логина ${login}.`);
+    return;
+  }
+
+  await issueExternalLoginCode(ctx, user, login);
+}
+
+async function issueExternalLoginCode(ctx: AnyContext, user: StoredUser, login: string): Promise<void> {
+  const result = await store.issueExternalLoginCode(login, user.id);
+  await ctx.reply(
+    [
+      `${ui.ok} Код входа для логина ${result.login}: ${result.code}`,
+      'Введите этот код в приложении рядом с вашим логином.',
+      'Код действует 10 минут.'
+    ].join('\n')
+  );
 }
 
 async function showCatalog(ctx: AnyContext, universityId?: string, pageRaw = 0) {
@@ -802,7 +871,7 @@ async function showMyRegistrations(ctx: AnyContext, pageRaw = 0) {
     return;
   }
 
-  const registrations = (await store.listRegistrations()).filter((item) => item.userId === user.id && isActiveStatus(item.status));
+  const registrations = (await store.listRegistrations(undefined, user.id)).filter((item) => isActiveStatus(item.status));
   const page = clampPage(pageRaw, registrations.length);
 
   if (registrations.length === 0) {
@@ -852,10 +921,15 @@ async function showMyRegistrations(ctx: AnyContext, pageRaw = 0) {
 
 async function cancelRegistration(ctx: AnyContext, registrationId: string) {
   const user = await requireConsent(ctx);
-  const registrations = await store.listRegistrations();
+
+  if (!user) {
+    return;
+  }
+
+  const registrations = await store.listRegistrations(undefined, user.id);
   const registration = registrations.find((item) => item.id === registrationId);
 
-  if (!user || !registration || registration.userId !== user.id) {
+  if (!registration || registration.userId !== user.id) {
     await renderSingle(ctx, `${ui.error} Запись не найдена. Возможно, она уже была изменена.`, rows([[button('Мои записи на мероприятия', 'my')]]));
     return;
   }
@@ -880,7 +954,7 @@ async function cancelRegistration(ctx: AnyContext, registrationId: string) {
     return;
   }
 
-  await store.updateRegistration(registration.id, { status });
+  await store.updateRegistration(registration.id, { status }, user.id);
   logger.info(
     businessLog('registration_cancelled_by_user', {
       registration_id: registration.id,
@@ -897,15 +971,20 @@ async function cancelRegistration(ctx: AnyContext, registrationId: string) {
 
 async function toggleNotifications(ctx: AnyContext, registrationId: string, enabled: boolean) {
   const user = await requireConsent(ctx);
-  const registrations = await store.listRegistrations();
+
+  if (!user) {
+    return;
+  }
+
+  const registrations = await store.listRegistrations(undefined, user.id);
   const registration = registrations.find((item) => item.id === registrationId);
 
-  if (!user || !registration || registration.userId !== user.id) {
+  if (!registration || registration.userId !== user.id) {
     await renderSingle(ctx, `${ui.error} Запись не найдена. Откройте список своих записей и попробуйте ещё раз.`, rows([[button('Мои записи на мероприятия', 'my')]]));
     return;
   }
 
-  await store.updateRegistration(registration.id, { notificationsEnabled: enabled });
+  await store.updateRegistration(registration.id, { notificationsEnabled: enabled }, user.id);
   logger.info(
     businessLog(enabled ? 'registration_notifications_enabled' : 'registration_notifications_disabled', {
       registration_id: registration.id,
@@ -923,7 +1002,7 @@ function canManage(user: StoredUser, event: EventCard): boolean {
     return true;
   }
 
-  return (user.role === 'admin' || user.role === 'organizer') && user.universityId === event.universityId;
+  return canEditEvent(user, event) || isEventRegistrar(user, event);
 }
 
 function canCreateEvent(user: StoredUser): boolean {
@@ -944,6 +1023,14 @@ function canDeleteEvent(user: StoredUser, event: EventCard): boolean {
   }
 
   return (user.role === 'organizer' || user.role === 'admin') && user.universityId === event.universityId;
+}
+
+function isEventRegistrar(user: StoredUser, event: EventCard): boolean {
+  return event.registrarIds.includes(user.id);
+}
+
+function canMarkAttendance(user: StoredUser, event: EventCard): boolean {
+  return canEditEvent(user, event) || isEventRegistrar(user, event);
 }
 
 function eventCreateHelp(universityId?: string): string {
@@ -1704,12 +1791,17 @@ function buildEditPatch(event: EventCard, field: EditableEventField, raw: string
 async function showOrganizerMenu(ctx: AnyContext, pageRaw = 0) {
   const user = await requireConsent(ctx);
 
-  if (!user || (user.role !== 'admin' && user.role !== 'tech_admin' && user.role !== 'organizer')) {
-    await renderSingle(ctx, `${ui.warn} Меню организатора доступно только организатору или администратору.`, rows([[button('Главное меню', 'menu')]]));
+  if (!user) {
     return;
   }
 
   const manageable = await store.listManageableEvents(user.id, user.role);
+
+  if (manageable.length === 0 && user.role !== 'admin' && user.role !== 'tech_admin' && user.role !== 'organizer') {
+    await renderSingle(ctx, `${ui.warn} Управление мероприятиями доступно организаторам, администраторам и назначенным регистраторам.`, rows([[button('Главное меню', 'menu')]]));
+    return;
+  }
+
   const page = clampPage(pageRaw, manageable.length);
 
   if (manageable.length === 0) {
@@ -1723,7 +1815,7 @@ async function showOrganizerMenu(ctx: AnyContext, pageRaw = 0) {
 
   await renderSingle(
     ctx,
-      [`${ui.list} Мероприятия организатора:`, `Страница ${page + 1} из ${pageCount(manageable.length)}.`, '', 'Здесь показаны мероприятия, которыми вы управляете. Личные записи на мероприятия находятся в отдельном пункте "Мои записи на мероприятия".', '', canCreateEvent(user) ? 'Создание и изменение проходят пошагово через /org_create и /org_edit.' : 'Доступные действия откроются в карточке мероприятия.'].join('\n'),
+      [`${ui.list} Управление мероприятиями:`, `Страница ${page + 1} из ${pageCount(manageable.length)}.`, '', 'Здесь показаны мероприятия, которыми вы управляете или где назначены регистратором. Личные записи на мероприятия находятся в отдельном пункте "Мои записи на мероприятия".', '', canCreateEvent(user) ? 'Создание и изменение проходят пошагово через /org_create и /org_edit.' : 'Доступные действия откроются в карточке мероприятия.'].join('\n'),
     rows([
       ...(manageable.length > pageSize ? [paginationButtons(page, manageable.length, (nextPage) => `org:page:${nextPage}`)] : []),
       ...(canCreateEvent(user) ? [[button('Создать мероприятие', 'org:create')]] : []),
@@ -2232,12 +2324,12 @@ async function showOrganizerEvent(ctx: AnyContext, eventId: string) {
   const user = await requireConsent(ctx);
   const event = await eventById(eventId);
 
-  if (!user || !event || (!canEditEvent(user, event) && !canDeleteEvent(user, event))) {
+  if (!user || !event || (!canManage(user, event) && !canDeleteEvent(user, event))) {
     await renderSingle(ctx, `${ui.warn} Нет доступа к этому мероприятию.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
-  const registrations = await store.listRegistrations(event.id);
+  const registrations = await store.listRegistrations(event.id, undefined, user.id);
   const active = registrations.filter((item) => isActiveStatus(item.status)).length;
 
   await renderSingle(
@@ -2248,11 +2340,13 @@ async function showOrganizerEvent(ctx: AnyContext, eventId: string) {
       `Лимит: ${event.capacity}`,
       `Активных записей: ${active}`,
       `Свободно: ${Math.max(event.capacity - active, 0)}`,
+      isEventRegistrar(user, event) && !canEditEvent(user, event) ? 'Ваша роль: регистратор мероприятия' : '',
       '',
       'Для поиска отправьте: /find КОД'
     ].join('\n'),
     rows([
-      ...(canEditEvent(user, event) ? [[button('Список записей', `org:regs:${event.id}`)]] : []),
+      ...(canManage(user, event) ? [[button('Список записей', `org:regs:${event.id}`)]] : []),
+      ...(canEditEvent(user, event) ? [[button('Регистраторы', `org:registrars:${event.id}`)]] : []),
       ...(canEditEvent(user, event) && !event.deletedAt ? [[button('Уведомления', `org:notify:${event.id}`)]] : []),
       ...(canEditEvent(user, event) && !event.deletedAt ? [[button('Изменить мероприятие', `org:edit:${event.id}`)]] : []),
       ...(event.deletedAt && canDeleteEvent(user, event) ? [[button('Восстановить мероприятие', `org:restore:${event.id}`, 'positive')]] : []),
@@ -2450,6 +2544,16 @@ async function handleFlowMessage(ctx: AnyContext, text: string): Promise<boolean
     return true;
   }
 
+  if (state.kind === 'registrar') {
+    await handleRegistrarFlow(ctx, state, text);
+    return true;
+  }
+
+  if (state.kind === 'admin_role') {
+    await handleAdminRoleFlow(ctx, state, text);
+    return true;
+  }
+
   await handleEditEventFlow(ctx, state, text);
   return true;
 }
@@ -2463,7 +2567,7 @@ async function confirmDeleteOrganizerEvent(ctx: AnyContext, eventId: string) {
     return;
   }
 
-  const active = (await store.listRegistrations(event.id)).filter((registration) => isActiveStatus(registration.status)).length;
+  const active = (await store.listRegistrations(event.id, undefined, user.id)).filter((registration) => isActiveStatus(registration.status)).length;
 
   await renderSingle(
     ctx,
@@ -2528,7 +2632,7 @@ async function showOrganizerRegistrations(ctx: AnyContext, eventId: string, page
     return;
   }
 
-  const registrations = await store.listRegistrations(event.id);
+  const registrations = await store.listRegistrations(event.id, undefined, user.id);
   const page = clampPage(pageRaw, registrations.length);
 
   if (registrations.length === 0) {
@@ -2537,7 +2641,8 @@ async function showOrganizerRegistrations(ctx: AnyContext, eventId: string, page
   }
 
   const lines = pageSlice(registrations, page).map((item) => {
-    return `${item.code} - ${item.userName} - ${statusLabels[item.status]} - ${slotLabel(event, item.slotId)}`;
+    const attendance = item.attendedAt ? 'посещение отмечено' : 'не пришел';
+    return `${item.code} - ${item.userName} - ${statusLabels[item.status]} - ${attendance} - ${slotLabel(event, item.slotId)}`;
   });
 
   await renderSingle(
@@ -2550,15 +2655,198 @@ async function showOrganizerRegistrations(ctx: AnyContext, eventId: string, page
   );
 }
 
+async function showEventRegistrars(ctx: AnyContext, eventId: string) {
+  const user = await requireConsent(ctx);
+  const event = await eventById(eventId);
+
+  if (!user || !event || !canEditEvent(user, event)) {
+    await renderSingle(ctx, `${ui.warn} Назначать регистраторов может только организатор или админ своего вуза.`, rows([[button('Назад', `org:event:${eventId}`)]]));
+    return;
+  }
+
+  const registrars = await store.listEventRegistrars(event.id, user.id);
+  const lines = await Promise.all(
+    registrars.map(async (registrar) => {
+      const stored = await store.getUser(registrar.userId, user.id);
+      return `${registrar.userId} - ${stored?.name ?? 'пользователь ещё не писал боту'} - назначен ${formatDate(registrar.assignedAt)}`;
+    })
+  );
+
+  await renderSingle(
+    ctx,
+    [
+      `${ui.admin} Регистраторы мероприятия`,
+      event.title,
+      '',
+      lines.length > 0 ? lines.join('\n') : 'Регистраторы пока не назначены.',
+      '',
+      'Можно назначить или снять регистратора кнопками ниже.'
+    ].join('\n'),
+    rows([
+      [button('Добавить регистратора', `org:registrar-add:${event.id}`, 'positive')],
+      ...(registrars.length > 0 ? [[button('Снять регистратора', `org:registrar-remove:${event.id}`, 'negative')]] : []),
+      [button('Назад', `org:event:${event.id}`)]
+    ])
+  );
+}
+
+async function startRegistrarFlow(ctx: AnyContext, eventId: string, action: 'add' | 'remove') {
+  const user = await requireConsent(ctx);
+  const event = await eventById(eventId);
+  const key = userFlowKey(ctx);
+
+  if (!key || !user || !event || !canEditEvent(user, event)) {
+    await renderSingle(ctx, `${ui.warn} Нет доступа к управлению регистраторами.`, rows([[button('Назад', `org:event:${eventId}`)]]));
+    return;
+  }
+
+  flowStates.set(key, { kind: 'registrar', action, eventId: event.id });
+  await sendNewMessage(
+    ctx,
+    [
+      action === 'add' ? `${ui.info} Введите MAX ID пользователя, которого нужно назначить регистратором.` : `${ui.info} Введите MAX ID регистратора, которого нужно снять.`,
+      `Мероприятие: ${event.title}`
+    ].join('\n'),
+    rows([[button('Отмена', 'flow:cancel')]])
+  );
+}
+
+async function handleRegistrarFlow(ctx: AnyContext, state: Extract<FlowState, { kind: 'registrar' }>, text: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const user = await requireConsent(ctx);
+  const targetId = parseUserId(text);
+  const event = await eventById(state.eventId);
+
+  if (!key || !user || !event || !canEditEvent(user, event)) {
+    if (key) flowStates.delete(key);
+    await sendNewMessage(ctx, `${ui.warn} Нет доступа к управлению регистраторами.`, rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  if (!targetId) {
+    await sendNewMessage(ctx, `${ui.error} MAX ID должен быть числом. Попробуйте ещё раз.`, rows([[button('Отмена', 'flow:cancel')]]));
+    return;
+  }
+
+  if (state.action === 'add') {
+    const target = await store.getUser(targetId, user.id);
+
+    if (target?.universityId && target.universityId !== event.universityId) {
+      await sendNewMessage(ctx, `${ui.warn} Регистратор должен относиться к тому же вузу, что и мероприятие.`, rows([[button('Отмена', 'flow:cancel')]]));
+      return;
+    }
+
+    const registrar = await store.assignEventRegistrar(event.id, targetId, user.id);
+    flowStates.delete(key);
+    logger.info(
+      businessLog('event_registrar_assigned', {
+        event_id: event.id,
+        university_id: event.universityId,
+        registrar_user_id: registrar.userId,
+        actor_user_id: user.id,
+        source: 'flow'
+      }),
+      'event registrar assigned by flow'
+    );
+    await sendNewMessage(ctx, `${ui.ok} Регистратор назначен: MAX ID ${registrar.userId}`, rows([[button('Регистраторы', `org:registrars:${event.id}`)], [button('Назад', `org:event:${event.id}`)]]));
+    return;
+  }
+
+  const result = await store.removeEventRegistrar(event.id, targetId, user.id);
+  flowStates.delete(key);
+  logger.info(
+    businessLog('event_registrar_removed', {
+      event_id: event.id,
+      university_id: event.universityId,
+      registrar_user_id: targetId,
+      actor_user_id: user.id,
+      result,
+      source: 'flow'
+    }),
+    'event registrar removed by flow'
+  );
+  await sendNewMessage(
+    ctx,
+    result === 'removed' ? `${ui.ok} Регистратор снят: MAX ID ${targetId}` : `${ui.info} Этот пользователь не был регистратором мероприятия.`,
+    rows([[button('Регистраторы', `org:registrars:${event.id}`)], [button('Назад', `org:event:${event.id}`)]])
+  );
+}
+
+async function assignRegistrarFromCommand(ctx: AnyContext, eventIdRaw: string, userIdRaw: string) {
+  const actor = await requireConsent(ctx);
+  const targetId = parseUserId(userIdRaw);
+  const event = await eventById(eventIdRaw.trim());
+
+  if (!actor || !targetId || !event || !canEditEvent(actor, event)) {
+    await renderSingle(ctx, `${ui.warn} Не удалось назначить регистратора. Проверьте event_id, MAX ID и права на мероприятие.`, rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const target = await store.getUser(targetId, actor.id);
+
+  if (target?.universityId && target.universityId !== event.universityId) {
+    await renderSingle(ctx, `${ui.warn} Регистратор должен относиться к тому же вузу, что и мероприятие.`, rows([[button('Назад', `org:event:${event.id}`)]]));
+    return;
+  }
+
+  const registrar = await store.assignEventRegistrar(event.id, targetId, actor.id);
+  logger.info(
+    businessLog('event_registrar_assigned', {
+      event_id: event.id,
+      university_id: event.universityId,
+      registrar_user_id: registrar.userId,
+      actor_user_id: actor.id
+    }),
+    'event registrar assigned by bot'
+  );
+  await renderSingle(ctx, `${ui.ok} Регистратор назначен: MAX ID ${registrar.userId}`, rows([[button('Регистраторы', `org:registrars:${event.id}`)], [button('Назад', `org:event:${event.id}`)]]));
+}
+
+async function removeRegistrarFromCommand(ctx: AnyContext, eventIdRaw: string, userIdRaw: string) {
+  const actor = await requireConsent(ctx);
+  const targetId = parseUserId(userIdRaw);
+  const event = await eventById(eventIdRaw.trim());
+
+  if (!actor || !targetId || !event || !canEditEvent(actor, event)) {
+    await renderSingle(ctx, `${ui.warn} Не удалось снять регистратора. Проверьте event_id, MAX ID и права на мероприятие.`, rows([[button('Назад', 'org')]]));
+    return;
+  }
+
+  const result = await store.removeEventRegistrar(event.id, targetId, actor.id);
+  logger.info(
+    businessLog('event_registrar_removed', {
+      event_id: event.id,
+      university_id: event.universityId,
+      registrar_user_id: targetId,
+      actor_user_id: actor.id,
+      result
+    }),
+    'event registrar removed by bot'
+  );
+  await renderSingle(
+    ctx,
+    result === 'removed' ? `${ui.ok} Регистратор снят: MAX ID ${targetId}` : `${ui.info} Этот пользователь не был регистратором мероприятия.`,
+    rows([[button('Регистраторы', `org:registrars:${event.id}`)], [button('Назад', `org:event:${event.id}`)]])
+  );
+}
+
 async function findRegistration(ctx: AnyContext, code: string) {
   const user = await requireConsent(ctx);
   const registration = await store.findRegistrationByCode(code);
   const event = registration ? await eventById(registration.eventId) : undefined;
 
-  if (!user || !registration || !event || !canEditEvent(user, event)) {
+  if (!user || !registration || !event || !canMarkAttendance(user, event)) {
     await renderSingle(ctx, `${ui.error} Запись не найдена или у вас нет доступа.`, rows([[button('Назад', 'org')]]));
     return;
   }
+
+  const actionButtons = canEditEvent(user, event)
+    ? [
+        [button('Подтверждена', `org:status:${registration.id}:confirmed`, 'positive')],
+        [button('Пришел', `org:status:${registration.id}:attended`, 'positive')],
+        [button('Отменить организатором', `org:status:${registration.id}:cancelled_by_organizer`, 'negative')]
+      ]
+    : [[button('Отметить пришедшим', `org:status:${registration.id}:attended`, 'positive')]];
 
   await renderSingle(
     ctx,
@@ -2567,28 +2855,32 @@ async function findRegistration(ctx: AnyContext, code: string) {
       `Мероприятие: ${event.title}`,
       `Участник: ${registration.userName}`,
       `Статус: ${statusLabels[registration.status]}`,
+      registration.attendedAt ? `Посещение: отмечено ${formatDate(registration.attendedAt)}` : 'Посещение: не отмечено',
       `Слот: ${slotLabel(event, registration.slotId)}`
     ].join('\n'),
-    rows([
-      [button('Подтверждена', `org:status:${registration.id}:confirmed`, 'positive')],
-      [button('Пришел', `org:status:${registration.id}:attended`, 'positive')],
-      [button('Отменить организатором', `org:status:${registration.id}:cancelled_by_organizer`, 'negative')],
-      [button('Назад', `org:event:${event.id}`)]
-    ])
+    rows([...actionButtons, [button('Назад', `org:event:${event.id}`)]])
   );
 }
 
 async function setOrganizerStatus(ctx: AnyContext, registrationId: string, status: RegistrationStatus) {
   const user = await requireConsent(ctx);
-  const registration = (await store.listRegistrations()).find((item) => item.id === registrationId);
+  const registration = (await store.listRegistrations(undefined, undefined, user?.id)).find((item) => item.id === registrationId);
   const event = registration ? await eventById(registration.eventId) : undefined;
 
-  if (!user || !registration || !event || !canEditEvent(user, event)) {
+  if (!user || !registration || !event || !canMarkAttendance(user, event)) {
     await renderSingle(ctx, `${ui.error} Запись не найдена или у вас нет доступа.`, rows([[button('Назад', 'org')]]));
     return;
   }
 
-  const updated = await store.updateRegistration(registration.id, { status });
+  if (!canEditEvent(user, event) && status !== 'attended') {
+    await renderSingle(ctx, `${ui.warn} Регистратор может только отметить участника как пришедшего.`, rows([[button('Назад', `org:event:${event.id}`)]]));
+    return;
+  }
+
+  const attendancePatch = status === 'attended'
+    ? { attendedAt: new Date().toISOString(), attendedBy: user.id }
+    : { attendedAt: undefined, attendedBy: undefined };
+  const updated = await store.updateRegistration(registration.id, { status, ...attendancePatch }, user.id);
   logger.info(
     businessLog('registration_status_changed', {
       registration_id: registration.id,
@@ -2635,7 +2927,7 @@ async function sendEventNotification(ctx: AnyContext, eventId: string, kind: key
     return;
   }
 
-  const recipients = (await store.listRegistrations(event.id)).filter(
+  const recipients = (await store.listRegistrations(event.id, undefined, user.id)).filter(
     (item) => isActiveStatus(item.status) && item.notificationsEnabled
   );
 
@@ -2711,16 +3003,17 @@ async function showAdminPanel(ctx: AnyContext) {
     [
       `${ui.admin} Админ-панель`,
       '',
-      user.role === 'tech_admin' ? 'Добавить админа: /admin_add MAX_ID university_id' : 'Админ может назначать организаторов только своего вуза.',
-      user.role === 'tech_admin' ? 'Добавить организатора: /admin_org MAX_ID university_id' : 'Добавить организатора: /admin_org MAX_ID',
-      'Снять права: /admin_remove MAX_ID',
-      user.role === 'tech_admin' ? 'Сменить вуз: /admin_university MAX_ID university_id' : '',
-      'Открыть карточку: /admin_user MAX_ID',
+      user.role === 'tech_admin' ? 'Техадмин может назначать админов, организаторов, техадминов и менять вуз.' : 'Админ может назначать организаторов только своего вуза.',
+      'Выберите действие кнопками ниже.',
       '',
       `Ваш вуз: ${user.universityId ?? 'все вузы'}`,
       'MAX ID пользователь может узнать командой /whoami.'
     ].join('\n'),
     rows([
+      ...(user.role === 'tech_admin' ? [[button('Добавить админа', 'admin:start-role:admin')]] : []),
+      [button('Добавить организатора', 'admin:start-role:organizer')],
+      ...(user.role === 'tech_admin' ? [[button('Добавить техадмина', 'admin:start-role:tech_admin')]] : []),
+      [button('Снять права', 'admin:start-role:applicant', 'negative')],
       [button('Список вузов', 'admin:universities')],
       ...(user.role === 'tech_admin' ? [[button('Список админов', 'admin:list:admin')]] : []),
       [button('Список организаторов', 'admin:list:organizer')],
@@ -2742,7 +3035,7 @@ async function showUsersByRole(ctx: AnyContext, role: Role, pageRaw = 0) {
     return;
   }
 
-  const users = await store.listUsers(role, user.role === 'tech_admin' ? undefined : user.universityId);
+  const users = await store.listUsers(role, user.role === 'tech_admin' ? undefined : user.universityId, user.id);
   const page = clampPage(pageRaw, users.length);
 
   if (users.length === 0) {
@@ -2770,7 +3063,7 @@ async function showAdminUserCard(ctx: AnyContext, userIdRaw: string) {
     return;
   }
 
-  const target = await store.getUser(targetId);
+  const target = await store.getUser(targetId, user.id);
   const canManageTarget = user.role === 'tech_admin' || target?.universityId === user.universityId || !target;
 
   if (!canManageTarget) {
@@ -2802,6 +3095,120 @@ async function showAdminUserCard(ctx: AnyContext, userIdRaw: string) {
   );
 }
 
+async function startAdminRoleFlow(ctx: AnyContext, role: Role, universityIdRaw?: string) {
+  const user = await requireRoleAdmin(ctx);
+  const key = userFlowKey(ctx);
+  const universityId = normalizeUniversityId(universityIdRaw);
+
+  if (!key || !user) {
+    return;
+  }
+
+  if (role === 'admin' && user.role !== 'tech_admin') {
+    await renderSingle(ctx, `${ui.warn} Админа может назначить только техадмин.`, rows([[button('Назад', 'admin')]]));
+    return;
+  }
+
+  if (role === 'tech_admin' && user.role !== 'tech_admin') {
+    await renderSingle(ctx, `${ui.warn} Техадмина может назначить только техадмин.`, rows([[button('Назад', 'admin')]]));
+    return;
+  }
+
+  if ((role === 'admin' || role === 'organizer') && user.role === 'tech_admin' && !universityId) {
+    await showAdminUniversityPicker(ctx, role);
+    return;
+  }
+
+  const resolvedUniversityId = role === 'admin' || role === 'organizer' ? universityId ?? user.universityId : undefined;
+  flowStates.set(key, { kind: 'admin_role', role, universityId: resolvedUniversityId });
+  await sendNewMessage(
+    ctx,
+    [
+      `${ui.admin} ${adminRoleFlowTitle(role)}`,
+      resolvedUniversityId ? `Вуз: ${resolvedUniversityId}` : '',
+      '',
+      'Введите MAX ID пользователя.'
+    ].filter(Boolean).join('\n'),
+    rows([[button('Отмена', 'flow:cancel')], [button('Назад', 'admin')]])
+  );
+}
+
+async function showAdminUniversityPicker(ctx: AnyContext, role: Role, pageRaw = 0) {
+  const user = await requireRoleAdmin(ctx);
+
+  if (!user || user.role !== 'tech_admin' || (role !== 'admin' && role !== 'organizer')) {
+    await renderSingle(ctx, `${ui.warn} Выбор вуза здесь доступен только техадмину.`, rows([[button('Назад', 'admin')]]));
+    return;
+  }
+
+  const universities = await store.listUniversities();
+  const page = clampPage(pageRaw, universities.length);
+  const pageUniversities = pageSlice(universities, page);
+
+  await renderSingle(
+    ctx,
+    [`${ui.admin} Выберите вуз для роли "${roleLabels[role]}"`, `Страница ${page + 1} из ${pageCount(universities.length)}.`].join('\n'),
+    rows([
+      ...(universities.length > pageSize ? [paginationButtons(page, universities.length, (nextPage) => `admin:pick-university:${role}:${nextPage}`)] : []),
+      ...pageUniversities.map((university) => [button(`${university.shortTitle} - ${university.city}`, `admin:start-role:${role}:${university.id}`)]),
+      [button('Назад', 'admin')]
+    ])
+  );
+}
+
+async function handleAdminRoleFlow(ctx: AnyContext, state: Extract<FlowState, { kind: 'admin_role' }>, text: string): Promise<void> {
+  const key = userFlowKey(ctx);
+  const user = await requireRoleAdmin(ctx);
+  const targetId = parseUserId(text);
+
+  if (!key || !user) {
+    return;
+  }
+
+  if (!targetId) {
+    await sendNewMessage(ctx, `${ui.error} MAX ID должен быть числом. Попробуйте ещё раз.`, rows([[button('Отмена', 'flow:cancel')]]));
+    return;
+  }
+
+  if (targetId === user.id && state.role !== 'tech_admin') {
+    await sendNewMessage(ctx, `${ui.warn} Нельзя снять технические права у самого себя через бота.`, rows([[button('Отмена', 'flow:cancel')]]));
+    return;
+  }
+
+  const universityId = state.role === 'admin' || state.role === 'organizer' ? state.universityId ?? user.universityId : undefined;
+
+  if (!canAssignRole(user, state.role, universityId)) {
+    await sendNewMessage(ctx, `${ui.warn} Недостаточно прав для назначения этой роли или вуза.`, rows([[button('Назад', 'admin')]]));
+    flowStates.delete(key);
+    return;
+  }
+
+  if ((state.role === 'admin' || state.role === 'organizer') && !universityId) {
+    await sendNewMessage(ctx, `${ui.info} Для роли админа или организатора нужно выбрать вуз.`, rows([[button('Назад', 'admin')]]));
+    flowStates.delete(key);
+    return;
+  }
+
+  const updated = await store.setUserRole(targetId, state.role, state.role === 'admin' || state.role === 'organizer' ? universityId : null, user.id);
+  flowStates.delete(key);
+  logger.info(
+    businessLog('user_role_assigned', {
+      actor_user_id: user.id,
+      target_user_id: updated.id,
+      target_role: updated.role,
+      university_id: updated.universityId,
+      source: 'flow'
+    }),
+    'user role assigned by flow'
+  );
+  await sendNewMessage(ctx, `${ui.ok} Готово: ${formatUserLine(updated)}`, rows([[button('Админ-панель', 'admin')], [button('Главное меню', 'menu')]]));
+}
+
+function adminRoleFlowTitle(role: Role): string {
+  if (role === 'applicant') return 'Снять права пользователя';
+  return `Назначить роль: ${roleLabels[role]}`;
+}
+
 async function setRoleFromAdmin(ctx: AnyContext, userIdRaw: string, role: Role, universityIdRaw?: string) {
   const user = await requireRoleAdmin(ctx);
   const targetId = parseUserId(userIdRaw);
@@ -2828,7 +3235,7 @@ async function setRoleFromAdmin(ctx: AnyContext, userIdRaw: string, role: Role, 
     return;
   }
 
-  const updated = await store.setUserRole(targetId, role, role === 'admin' || role === 'organizer' ? universityId : null);
+  const updated = await store.setUserRole(targetId, role, role === 'admin' || role === 'organizer' ? universityId : null, user.id);
   logger.info(
     businessLog('user_role_assigned', {
       actor_user_id: user.id,
@@ -2851,7 +3258,7 @@ async function changeUserUniversity(ctx: AnyContext, userIdRaw: string, universi
     return;
   }
 
-  const target = await store.getUser(targetId);
+  const target = await store.getUser(targetId, user.id);
 
   if (!target || (target.role !== 'admin' && target.role !== 'organizer')) {
     await renderSingle(ctx, `${ui.warn} Вуз можно менять только админам и организаторам.`, rows([[button('Назад', 'admin')]]));
@@ -2863,7 +3270,7 @@ async function changeUserUniversity(ctx: AnyContext, userIdRaw: string, universi
     return;
   }
 
-  const updated = await store.setUserRole(targetId, target.role, universityId);
+  const updated = await store.setUserRole(targetId, target.role, universityId, user.id);
   logger.info(
     businessLog('user_university_changed', {
       actor_user_id: user.id,
@@ -2909,6 +3316,35 @@ function normalizeUniversityId(raw?: string): string | undefined {
   return value && value !== '-' ? value : undefined;
 }
 
+function normalizeExternalLogin(raw?: string): string | undefined {
+  const value = raw?.trim().toLowerCase();
+  return value && /^[a-z0-9._@-]{3,80}$/.test(value) ? value : undefined;
+}
+
+function parseLoginStartPayload(payload?: string): string | undefined {
+  if (!payload) {
+    return undefined;
+  }
+
+  if (payload.startsWith('login.')) {
+    return decodeLoginPayload(payload.slice('login.'.length));
+  }
+
+  if (payload.startsWith('login_')) {
+    return decodeURIComponent(payload.slice('login_'.length));
+  }
+
+  return undefined;
+}
+
+function decodeLoginPayload(payload: string): string | undefined {
+  try {
+    return Buffer.from(payload, 'base64url').toString('utf8');
+  } catch {
+    return undefined;
+  }
+}
+
 function splitAdminArgs(raw: string): [string, string?] {
   const [userId = '', universityId] = raw.trim().split(/\s+/, 2);
   return [userId, universityId];
@@ -2951,7 +3387,10 @@ try {
     { name: 'admin_org', description: 'Назначить организатора по MAX ID' },
     { name: 'admin_remove', description: 'Снять права по MAX ID' },
     { name: 'admin_university', description: 'Сменить вуз админа или организатора' },
+    { name: 'registrar_add', description: 'Назначить регистратора мероприятия' },
+    { name: 'registrar_remove', description: 'Снять регистратора мероприятия' },
     { name: 'find', description: 'Найти запись по коду' },
+    { name: 'login', description: 'Получить код входа для внешнего клиента' },
     { name: 'whoami', description: 'Показать ваш MAX ID' }
   ]);
 } catch (error) {
@@ -2960,14 +3399,47 @@ try {
 
 bot.on('bot_started', async (ctx) => {
   logger.info(logContext(ctx), 'bot started conversation');
-  await rememberUser(ctx);
+  const startPayload = typeof ctx.startPayload === 'string' ? ctx.startPayload : undefined;
+
+  const loginFromPayload = parseLoginStartPayload(startPayload);
+
+  if (loginFromPayload) {
+    await handleExternalLogin(ctx, loginFromPayload);
+    return;
+  }
+
   await showWelcome(ctx);
 });
 
 bot.command('start', async (ctx) => {
   logger.info(logContext(ctx), 'command start');
+  const text = ctx.message?.body.text?.trim() ?? '';
+  const loginMatch = text.match(/^\/start\s+login_(.+)$/i);
+
+  if (loginMatch) {
+    await handleExternalLogin(ctx, decodeURIComponent(loginMatch[1]));
+    return;
+  }
+
   await showMainMenu(ctx);
 });
+
+bot.hears(/^\/start\s+login_(.+)$/i, async (ctx) => {
+  logger.info(logContext(ctx), 'deeplink login start');
+  await handleExternalLogin(ctx, decodeURIComponent(ctx.match?.[1] ?? ''));
+});
+
+bot.hears(/^\/start\s+login\.(.+)$/i, async (ctx) => {
+  logger.info(logContext(ctx), 'deeplink encoded login start');
+  const login = decodeLoginPayload(ctx.match?.[1] ?? '');
+  await handleExternalLogin(ctx, login ?? '');
+});
+
+bot.hears(/^\/login\s+(.+)$/i, async (ctx) => {
+  logger.info(logContext(ctx), 'command login');
+  await handleExternalLogin(ctx, ctx.match?.[1] ?? '');
+});
+
 bot.command('events', async (ctx) => {
   logger.info(logContext(ctx), 'command events');
   await showCatalog(ctx);
@@ -3031,6 +3503,14 @@ bot.hears(/^\/find\s+(.+)/i, async (ctx) => {
   await findRegistration(ctx, ctx.match?.[1] ?? '');
 });
 
+bot.hears(/^\/registrar_add\s+(\S+)\s+(.+)/i, async (ctx) => {
+  await assignRegistrarFromCommand(ctx, ctx.match?.[1] ?? '', ctx.match?.[2] ?? '');
+});
+
+bot.hears(/^\/registrar_remove\s+(\S+)\s+(.+)/i, async (ctx) => {
+  await removeRegistrarFromCommand(ctx, ctx.match?.[1] ?? '', ctx.match?.[2] ?? '');
+});
+
 bot.action(/.*/, async (ctx) => {
   await answerCallback(ctx);
   await rememberUser(ctx);
@@ -3062,6 +3542,13 @@ bot.action(/.*/, async (ctx) => {
     });
 
     await ctx.reply(`${ui.ok} Согласие сохранено.`);
+    const pendingLogin = pendingExternalLogins.get(sender.user_id);
+
+    if (pendingLogin) {
+      pendingExternalLogins.delete(sender.user_id);
+      await issueExternalLoginCode(ctx, user, pendingLogin);
+    }
+
     await showMainMenu(ctx, user);
     return;
   }
@@ -3075,6 +3562,7 @@ bot.action(/.*/, async (ctx) => {
   if (scope === 'universities' && a === 'page') return showUniversities(ctx, parsePage(b));
   if (payload === 'my') return showMyRegistrations(ctx);
   if (scope === 'my' && a === 'page') return showMyRegistrations(ctx, parsePage(b));
+  if (payload === 'web-panel') return showWebPanelInfo(ctx);
   if (payload === 'org') return showOrganizerMenu(ctx);
   if (scope === 'org' && a === 'page') return showOrganizerMenu(ctx, parsePage(b));
   if (scope === 'flow' && a === 'cancel') {
@@ -3113,6 +3601,9 @@ bot.action(/.*/, async (ctx) => {
   if (scope === 'org' && a === 'event') return showOrganizerEvent(ctx, b);
   if (scope === 'org' && a === 'edit') return showEditEventHelp(ctx, b);
   if (scope === 'org' && a === 'regs') return showOrganizerRegistrations(ctx, b, parsePage(c));
+  if (scope === 'org' && a === 'registrars') return showEventRegistrars(ctx, b);
+  if (scope === 'org' && a === 'registrar-add') return startRegistrarFlow(ctx, b, 'add');
+  if (scope === 'org' && a === 'registrar-remove') return startRegistrarFlow(ctx, b, 'remove');
   if (scope === 'org' && a === 'notify') return showNotifyMenu(ctx, b);
   if (scope === 'org' && a === 'delete') return confirmDeleteOrganizerEvent(ctx, b);
   if (scope === 'org' && a === 'delete-confirm') return deleteOrganizerEvent(ctx, b);
@@ -3121,6 +3612,8 @@ bot.action(/.*/, async (ctx) => {
   if (scope === 'org' && a === 'send') return sendEventNotification(ctx, b, c as keyof typeof notificationTemplates);
   if (scope === 'admin' && a === 'list') return showUsersByRole(ctx, b as Role, parsePage(c));
   if (scope === 'admin' && a === 'universities') return showUniversitiesForAdmin(ctx, parsePage(b));
+  if (scope === 'admin' && a === 'start-role') return startAdminRoleFlow(ctx, b as Role, c);
+  if (scope === 'admin' && a === 'pick-university') return showAdminUniversityPicker(ctx, b as Role, parsePage(c));
   if (scope === 'admin' && a === 'role') return setRoleFromAdmin(ctx, b, c as Role, d);
 
   await ctx.reply(`${ui.warn} Неизвестное действие. Откройте /start и выберите пункт из меню.`);

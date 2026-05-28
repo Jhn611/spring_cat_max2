@@ -85,6 +85,9 @@ services:
   api-gateway:
     image: springcat-app:latest
     command: ["node", "dist/api-gateway/index.js"]
+    env_file:
+      - path: .env
+        required: false
     environment:
       API_GATEWAY_PORT: "3050"
       DATA_SERVICE_URL: http://data-service:3060
@@ -116,7 +119,20 @@ services:
         required: false
     environment:
       API_GATEWAY_URL: http://api-gateway:3050
+      ADMIN_SPA_URL: ${ADMIN_SPA_URL:-http://localhost:3080}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  admin-spa:
+    build:
+      context: ./src/admin-spa
+      args:
+        VITE_API_BASE_URL: http://localhost:3050
+    ports:
+      - "3080:80"
     depends_on:
       api-gateway:
         condition: service_healthy

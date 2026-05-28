@@ -1,6 +1,6 @@
 export type Role = 'applicant' | 'organizer' | 'admin' | 'tech_admin';
-
 export type EventFormat = 'online' | 'offline';
+export type RegistrationStatus = 'confirmed' | 'attended' | 'cancelled_by_user' | 'cancelled_by_organizer' | 'late_cancelled';
 
 export type University = {
   id: string;
@@ -36,7 +36,7 @@ export type EventCard = {
   deletedAt?: string;
 };
 
-export type CreateEventInput = {
+export type EventInput = {
   universityId: string;
   title: string;
   startsAt: string;
@@ -52,28 +52,14 @@ export type CreateEventInput = {
   slots?: EventSlot[];
 };
 
-export type UpdateEventInput = Partial<CreateEventInput> & {
+export type StoredUser = {
+  id: number;
+  name: string;
+  username?: string;
+  role: Role;
   universityId?: string;
+  updatedAt: string;
 };
-
-export type DeleteEventResult = 'deleted' | 'not_found';
-
-export type NotificationJobInput = {
-  recipients: number[];
-  text: string;
-};
-
-export type NotificationJobResult = {
-  jobId: string;
-  recipients: number;
-};
-
-export type RegistrationStatus =
-  | 'confirmed'
-  | 'attended'
-  | 'cancelled_by_user'
-  | 'cancelled_by_organizer'
-  | 'late_cancelled';
 
 export type Registration = {
   id: string;
@@ -97,42 +83,28 @@ export type EventRegistrar = {
   assignedAt: string;
 };
 
-export type UserConsent = {
-  profile: boolean;
-  documentVersion: string;
-  acceptedAt: string;
-};
-
-export type StoredUser = {
-  id: number;
-  name: string;
-  username?: string;
-  role: Role;
-  universityId?: string;
-  consent?: UserConsent;
-  updatedAt: string;
-};
-
-export type StoreState = {
-  users: StoredUser[];
-  registrations: Registration[];
-};
-
-export type ExternalLoginStartResult = {
-  login: string;
-  linked: boolean;
-  userId?: number;
-  code?: string;
-  expiresAt?: string;
-};
-
-export type ExternalLoginCodeResult = {
-  login: string;
-  code: string;
-  expiresAt: string;
-};
-
-export type ExternalLoginVerifyResult = {
-  login: string;
+export type Session = {
+  accessToken: string;
   userId: number;
+  login: string;
+};
+
+export type View = 'events' | 'admins';
+
+export type EventFormState = {
+  id?: string;
+  universityId: string;
+  title: string;
+  date: string;
+  durationMinutes: string;
+  format: EventFormat;
+  capacity: string;
+  description: string;
+  requirements: string;
+  locationOrUrl: string;
+  cancelPolicy: string;
+  registrationClosed: boolean;
+  lateCancelAllowed: boolean;
+  slotStart: string;
+  slots: EventSlot[];
 };

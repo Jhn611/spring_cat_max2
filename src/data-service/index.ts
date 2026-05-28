@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import { DatabaseStore } from './database.js';
-import type { CreateEventInput, Registration, Role, StoredUser, UpdateEventInput } from '../shared/types.js';
+import type { CreateEventInput, EventRegistrar, Registration, Role, StoredUser, UpdateEventInput } from '../shared/types.js';
 
 const port = Number(process.env.DATA_SERVICE_PORT ?? 3060);
 const host = process.env.DATA_SERVICE_HOST ?? '0.0.0.0';
@@ -228,6 +228,54 @@ app.get<{ Params: { eventId: string } }>('/events/:eventId/free-seats', async (r
   return { freeSeats: await store.freeSeats(request.params.eventId) };
 });
 
+app.get<{ Params: { eventId: string } }>('/events/:eventId/registrars', async (request) => {
+  return store.listEventRegistrars(request.params.eventId);
+});
+
+app.post<{ Params: { eventId: string }; Body: { userId: number; assignedBy: number } }>(
+  '/events/:eventId/registrars',
+  async (request, reply) => {
+    if (!Number.isSafeInteger(request.body.userId) || request.body.userId <= 0 || !Number.isSafeInteger(request.body.assignedBy) || request.body.assignedBy <= 0) {
+      return reply.status(400).send({ error: 'invalid_registrar_assignment' });
+    }
+
+    const event = await store.getEvent(request.params.eventId);
+
+    if (!event) {
+      return reply.status(404).send({ error: 'not_found' });
+    }
+
+    const registrar: EventRegistrar = await store.assignEventRegistrar(request.params.eventId, request.body.userId, request.body.assignedBy);
+    app.log.info(
+      businessLog('event_registrar_assigned', {
+        event_id: registrar.eventId,
+        registrar_user_id: registrar.userId,
+        assigned_by: registrar.assignedBy,
+        university_id: event.universityId
+      }),
+      'event registrar assigned'
+    );
+    return reply.status(201).send(registrar);
+  }
+);
+
+app.delete<{ Params: { eventId: string; userId: string } }>('/events/:eventId/registrars/:userId', async (request, reply) => {
+  const removed = await store.removeEventRegistrar(request.params.eventId, Number(request.params.userId));
+
+  if (!removed) {
+    return reply.status(404).send({ error: 'not_found' });
+  }
+
+  app.log.info(
+    businessLog('event_registrar_removed', {
+      event_id: request.params.eventId,
+      registrar_user_id: Number(request.params.userId)
+    }),
+    'event registrar removed'
+  );
+  return reply.status(204).send();
+});
+
 app.get<{ Querystring: { role?: Role; universityId?: string } }>('/users', async (request) => {
   return store.listUsers(request.query.role, request.query.universityId);
 });
@@ -324,6 +372,47 @@ app.get<{ Querystring: { userId: string; eventId?: string } }>('/registrations/a
   return registration;
 });
 
+app.post<{ Body: { login: string } }>('/auth/external/start', async (request, reply) => {
+  const login = normalizeLoginInput(request.body.login);
+
+  if (!login) {
+    return reply.status(400).send({ error: 'login_required' });
+  }
+
+  const result = await store.startExternalLogin(login);
+  app.log.info(businessLog('external_login_started', { login: result.login, linked: result.linked }), 'external login started');
+  return result;
+});
+
+app.post<{ Body: { login: string; userId: number } }>('/auth/external/code', async (request, reply) => {
+  const login = normalizeLoginInput(request.body.login);
+
+  if (!login || !Number.isSafeInteger(request.body.userId) || request.body.userId <= 0) {
+    return reply.status(400).send({ error: 'invalid_login_code_request' });
+  }
+
+  const result = await store.issueExternalLoginCode(login, request.body.userId);
+  app.log.info(businessLog('external_login_code_issued', { login: result.login, user_id: request.body.userId }), 'external login code issued');
+  return result;
+});
+
+app.post<{ Body: { login: string; code: string } }>('/auth/external/verify', async (request, reply) => {
+  const login = normalizeLoginInput(request.body.login);
+
+  if (!login || !request.body.code) {
+    return reply.status(400).send({ error: 'invalid_login_verify_request' });
+  }
+
+  const result = await store.verifyExternalLoginCode(login, request.body.code);
+
+  if (!result) {
+    return reply.status(401).send({ error: 'invalid_or_expired_code' });
+  }
+
+  app.log.info(businessLog('external_login_verified', { login: result.login, user_id: result.userId }), 'external login verified');
+  return result;
+});
+
 const close = async () => {
   await app.close();
   await store.close();
@@ -336,3 +425,12 @@ app.log.info('initializing data service');
 await store.init();
 app.log.info({ port, host }, 'starting data service');
 await app.listen({ port, host });
+
+function normalizeLoginInput(login: unknown): string | undefined {
+  if (typeof login !== 'string') {
+    return undefined;
+  }
+
+  const normalized = login.trim().toLowerCase();
+  return /^[a-z0-9._@-]{3,80}$/.test(normalized) ? normalized : undefined;
+}

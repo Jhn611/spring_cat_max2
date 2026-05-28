@@ -65,8 +65,38 @@ export const registrations = pgTable(
     userName: text('user_name').notNull(),
     status: text('status').notNull(),
     notificationsEnabled: boolean('notifications_enabled').notNull(),
+    attendedAt: timestamp('attended_at', { withTimezone: true }),
+    attendedBy: bigint('attended_by', { mode: 'number' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull()
   },
   (table) => [index('registrations_event_id_idx').on(table.eventId), index('registrations_user_id_idx').on(table.userId)]
+);
+
+export const eventRegistrars = pgTable(
+  'event_registrars',
+  {
+    eventId: text('event_id').notNull(),
+    userId: bigint('user_id', { mode: 'number' }).notNull(),
+    assignedBy: bigint('assigned_by', { mode: 'number' }).notNull(),
+    assignedAt: timestamp('assigned_at', { withTimezone: true }).notNull()
+  },
+  (table) => [
+    primaryKey({ columns: [table.eventId, table.userId] }),
+    index('event_registrars_user_id_idx').on(table.userId),
+    index('event_registrars_event_id_idx').on(table.eventId)
+  ]
+);
+
+export const externalLogins = pgTable(
+  'external_logins',
+  {
+    login: text('login').primaryKey(),
+    userId: bigint('user_id', { mode: 'number' }),
+    codeHash: text('code_hash'),
+    codeExpiresAt: timestamp('code_expires_at', { withTimezone: true }),
+    linkedAt: timestamp('linked_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull()
+  },
+  (table) => [index('external_logins_user_id_idx').on(table.userId), index('external_logins_code_expires_at_idx').on(table.codeExpiresAt)]
 );

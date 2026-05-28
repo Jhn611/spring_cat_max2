@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from 'node:crypto';
 import pg from 'pg';
 import { and, asc, desc, eq, isNull, sql, type SQL } from 'drizzle-orm';
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
@@ -9,7 +10,11 @@ import type {
   DeleteEventResult,
   EventCard,
   EventFormat,
+  EventRegistrar,
   EventSlot,
+  ExternalLoginCodeResult,
+  ExternalLoginStartResult,
+  ExternalLoginVerifyResult,
   Registration,
   Role,
   StoredUser,
@@ -24,6 +29,8 @@ type DbRegistrationRow = typeof schema.registrations.$inferSelect;
 type DbEventRow = typeof schema.events.$inferSelect;
 type DbEventSlotRow = typeof schema.eventSlots.$inferSelect;
 type DbUniversityRow = typeof schema.universities.$inferSelect;
+type DbExternalLoginRow = typeof schema.externalLogins.$inferSelect;
+type DbEventRegistrarRow = typeof schema.eventRegistrars.$inferSelect;
 
 export class DatabaseStore {
   private readonly pool: pg.Pool;
@@ -194,16 +201,19 @@ export class DatabaseStore {
   async listManageableEvents(userId: number, role: Role): Promise<EventCard[]> {
     const user = await this.getUser(userId);
     const events = await this.listEvents(undefined, true);
+    const registrarEvents = events.filter((event) => event.registrarIds.includes(userId));
 
     if (role === 'tech_admin') {
       return events;
     }
 
     if (role === 'admin') {
-      return user?.universityId ? events.filter((event) => event.universityId === user.universityId) : [];
+      const adminEvents = user?.universityId ? events.filter((event) => event.universityId === user.universityId) : [];
+      return uniqueEvents([...adminEvents, ...registrarEvents]);
     }
 
-    return events.filter((event) => event.universityId === user?.universityId);
+    const organizerEvents = events.filter((event) => event.universityId === user?.universityId);
+    return uniqueEvents([...organizerEvents, ...registrarEvents]);
   }
 
   async listUsers(role?: Role, universityId?: string): Promise<StoredUser[]> {
@@ -328,6 +338,8 @@ export class DatabaseStore {
       userName: registration.userName,
       status: registration.status,
       notificationsEnabled: registration.notificationsEnabled,
+      attendedAt: registration.attendedAt ? toDate(registration.attendedAt) : null,
+      attendedBy: registration.attendedBy ?? null,
       createdAt: toDate(registration.createdAt),
       updatedAt: toDate(registration.updatedAt)
     });
@@ -352,6 +364,8 @@ export class DatabaseStore {
         userName: next.userName,
         status: next.status,
         notificationsEnabled: next.notificationsEnabled,
+        attendedAt: next.attendedAt ? toDate(next.attendedAt) : null,
+        attendedBy: next.attendedBy ?? null,
         createdAt: toDate(next.createdAt),
         updatedAt: toDate(next.updatedAt)
       })
@@ -398,6 +412,134 @@ export class DatabaseStore {
     return (await this.listRegistrations(eventId, userId)).find((item) => isActiveStatus(item.status));
   }
 
+  async listEventRegistrars(eventId: string): Promise<EventRegistrar[]> {
+    const rows = await this.db
+      .select()
+      .from(schema.eventRegistrars)
+      .where(eq(schema.eventRegistrars.eventId, eventId))
+      .orderBy(asc(schema.eventRegistrars.assignedAt));
+
+    return rows.map((row) => this.mapEventRegistrar(row));
+  }
+
+  async assignEventRegistrar(eventId: string, userId: number, assignedBy: number): Promise<EventRegistrar> {
+    const now = new Date();
+
+    await this.db
+      .insert(schema.eventRegistrars)
+      .values({
+        eventId,
+        userId,
+        assignedBy,
+        assignedAt: now
+      })
+      .onConflictDoUpdate({
+        target: [schema.eventRegistrars.eventId, schema.eventRegistrars.userId],
+        set: {
+          assignedBy,
+          assignedAt: now
+        }
+      });
+
+    return {
+      eventId,
+      userId,
+      assignedBy,
+      assignedAt: now.toISOString()
+    };
+  }
+
+  async removeEventRegistrar(eventId: string, userId: number): Promise<boolean> {
+    const result = await this.db
+      .delete(schema.eventRegistrars)
+      .where(and(eq(schema.eventRegistrars.eventId, eventId), eq(schema.eventRegistrars.userId, userId)));
+
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async startExternalLogin(login: string): Promise<ExternalLoginStartResult> {
+    const normalized = normalizeLogin(login);
+    const existing = await this.getExternalLogin(normalized);
+
+    if (!existing) {
+      await this.db.insert(schema.externalLogins).values({
+        login: normalized,
+        userId: null,
+        codeHash: null,
+        codeExpiresAt: null,
+        linkedAt: null,
+        updatedAt: new Date()
+      });
+
+      return { login: normalized, linked: false };
+    }
+
+    if (!existing.userId) {
+      return { login: normalized, linked: false };
+    }
+
+    const issued = await this.issueExternalLoginCode(normalized, existing.userId);
+    return { ...issued, linked: true, userId: existing.userId };
+  }
+
+  async issueExternalLoginCode(login: string, userId: number): Promise<ExternalLoginCodeResult> {
+    const normalized = normalizeLogin(login);
+    const code = randomDigits(6);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    const now = new Date();
+
+    await this.db
+      .insert(schema.externalLogins)
+      .values({
+        login: normalized,
+        userId,
+        codeHash: hashCode(code),
+        codeExpiresAt: expiresAt,
+        linkedAt: now,
+        updatedAt: now
+      })
+      .onConflictDoUpdate({
+        target: schema.externalLogins.login,
+        set: {
+          userId,
+          codeHash: hashCode(code),
+          codeExpiresAt: expiresAt,
+          linkedAt: sql`COALESCE(${schema.externalLogins.linkedAt}, ${now})`,
+          updatedAt: now
+        }
+      });
+
+    return { login: normalized, code, expiresAt: expiresAt.toISOString() };
+  }
+
+  async verifyExternalLoginCode(login: string, code: string): Promise<ExternalLoginVerifyResult | undefined> {
+    const normalized = normalizeLogin(login);
+    const existing = await this.getExternalLogin(normalized);
+
+    if (!existing?.userId || !existing.codeHash || !existing.codeExpiresAt) {
+      return undefined;
+    }
+
+    if (existing.codeExpiresAt.getTime() < Date.now()) {
+      return undefined;
+    }
+
+    if (existing.codeHash !== hashCode(normalizeCode(code))) {
+      return undefined;
+    }
+
+    await this.db
+      .update(schema.externalLogins)
+      .set({
+        codeHash: null,
+        codeExpiresAt: null,
+        updatedAt: new Date()
+      })
+      .where(eq(schema.externalLogins.login, normalized));
+
+    return { login: normalized, userId: existing.userId };
+  }
+
   private async nextEventId(title: string): Promise<string> {
     const base = slugify(title) || 'event';
 
@@ -412,6 +554,16 @@ export class DatabaseStore {
     }
 
     return `${base}-${Date.now().toString(36)}`;
+  }
+
+  private async getExternalLogin(login: string): Promise<DbExternalLoginRow | undefined> {
+    const rows = await this.db
+      .select()
+      .from(schema.externalLogins)
+      .where(eq(schema.externalLogins.login, normalizeLogin(login)))
+      .limit(1);
+
+    return rows[0];
   }
 
   private async fillEventDefaults(): Promise<void> {
@@ -545,11 +697,18 @@ export class DatabaseStore {
   }
 
   private async mapEvent(row: DbEventRow): Promise<EventCard> {
-    const slots = await this.db
-      .select()
-      .from(schema.eventSlots)
-      .where(eq(schema.eventSlots.eventId, row.id))
-      .orderBy(asc(schema.eventSlots.startsAt));
+    const [slots, registrars] = await Promise.all([
+      this.db
+        .select()
+        .from(schema.eventSlots)
+        .where(eq(schema.eventSlots.eventId, row.id))
+        .orderBy(asc(schema.eventSlots.startsAt)),
+      this.db
+        .select()
+        .from(schema.eventRegistrars)
+        .where(eq(schema.eventRegistrars.eventId, row.id))
+        .orderBy(asc(schema.eventRegistrars.assignedAt))
+    ]);
 
     return {
       id: row.id,
@@ -567,7 +726,8 @@ export class DatabaseStore {
       registrationClosed: row.registrationClosed,
       lateCancelAllowed: row.lateCancelAllowed,
       deletedAt: row.deletedAt ? row.deletedAt.toISOString() : undefined,
-      slots: slots.map((slot): EventSlot => this.mapSlot(slot))
+      slots: slots.map((slot): EventSlot => this.mapSlot(slot)),
+      registrarIds: registrars.map((registrar) => registrar.userId)
     };
   }
 
@@ -601,8 +761,19 @@ export class DatabaseStore {
       userName: row.userName,
       status: row.status as Registration['status'],
       notificationsEnabled: row.notificationsEnabled,
+      attendedAt: row.attendedAt?.toISOString(),
+      attendedBy: row.attendedBy ?? undefined,
       createdAt: row.createdAt.toISOString(),
       updatedAt: row.updatedAt.toISOString()
+    };
+  }
+
+  private mapEventRegistrar(row: DbEventRegistrarRow): EventRegistrar {
+    return {
+      eventId: row.eventId,
+      userId: row.userId,
+      assignedBy: row.assignedBy,
+      assignedAt: row.assignedAt.toISOString()
     };
   }
 
@@ -619,6 +790,33 @@ export class DatabaseStore {
 
 function toDate(value: string | Date): Date {
   return value instanceof Date ? value : new Date(value);
+}
+
+function normalizeLogin(login: string): string {
+  return login.trim().toLowerCase();
+}
+
+function normalizeCode(code: string): string {
+  return code.trim().replace(/\D/g, '');
+}
+
+function randomDigits(length: number): string {
+  const max = 10 ** length;
+  return String(randomBytes(4).readUInt32BE(0) % max).padStart(length, '0');
+}
+
+function hashCode(code: string): string {
+  return createHash('sha256').update(normalizeCode(code)).digest('hex');
+}
+
+function uniqueEvents(events: EventCard[]): EventCard[] {
+  const byId = new Map<string, EventCard>();
+
+  for (const event of events) {
+    byId.set(event.id, event);
+  }
+
+  return [...byId.values()].sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime());
 }
 
 function slugify(value: string): string {
