@@ -3,6 +3,8 @@ import type { ReactNode } from 'react';
 import { roleLabels } from '../../constants';
 import type { Role, View } from '../../types';
 
+// Общая оболочка держит навигацию, статус сессии и служебные действия панели.
+// Внутренние экраны передаются как children, чтобы layout не зависел от их логики.
 type AppLayoutProps = {
   role?: Role;
   view: View;

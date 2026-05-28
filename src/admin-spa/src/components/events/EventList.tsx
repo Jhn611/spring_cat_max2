@@ -2,6 +2,8 @@ import { CellSimple, Panel } from '@maxhub/max-ui';
 import type { EventCard, University } from '../../types';
 import { formatDateTime, universityName } from '../../utils';
 
+// Список мероприятий остаётся простым навигационным компонентом: он не меняет
+// данные сам, а только сообщает родительскому экрану, какую карточку выбрал сотрудник.
 type EventListProps = {
   events: EventCard[];
   universities: University[];

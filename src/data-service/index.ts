@@ -117,9 +117,10 @@ function assertSlots(slots: CreateEventInput['slots']): void {
   }
 }
 
-// DataService is the last line of defense for data quality: clients may be bots,
-// admin panels or future integrations, so the database-facing API validates the
-// same business limits that the MAX dialog validates for humans.
+// DataService остаётся последним уровнем проверки качества данных: запросы могут
+// приходить от бота, SPA-панели или будущих интеграций. Поэтому сервис повторно
+// проверяет доменные ограничения перед записью в БД, даже если клиент уже
+// валидировал ввод в интерфейсе.
 function assertEventInput(input: CreateEventInput | UpdateEventInput, partial = false): void {
   const requiredFields: (keyof CreateEventInput)[] = [
     'universityId',

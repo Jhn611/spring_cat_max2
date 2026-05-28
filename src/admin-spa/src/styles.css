@@ -1,3 +1,5 @@
+/* Стили SPA держат общий визуальный язык панели: layout, адаптив, формы и
+   состояния компонентов. Компоненты используют семантические классы, а не inline-стили. */
 :root {
   color: #17212b;
   background: #eef2f6;
@@ -315,7 +317,6 @@ h3 {
 
 .event-cell--active {
   border-color: #1d8cf8;
-  background: #eef7ff;
 }
 
 .panel-block,
@@ -473,7 +474,6 @@ h3 {
 }
 
 .table-row span {
-  color: #697b8c;
   font-size: 0.84rem;
 }
 

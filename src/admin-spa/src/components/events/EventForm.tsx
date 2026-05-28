@@ -3,6 +3,8 @@ import { Button, Input, Panel, Switch, Textarea } from '@maxhub/max-ui';
 import type { EventFormat, EventFormState, StoredUser, University } from '../../types';
 import { createSlot, isValidEventForm } from '../../utils';
 
+// Одна форма используется и для создания, и для редактирования мероприятия. Так
+// правила заполнения слотов, дат и вузовского ограничения не расходятся между режимами.
 type EventFormProps = {
   universities: University[];
   value: EventFormState;

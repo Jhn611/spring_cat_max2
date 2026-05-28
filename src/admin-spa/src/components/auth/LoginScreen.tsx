@@ -47,8 +47,9 @@ export function LoginScreen({ onLogin }: { onLogin: (session: Session) => void }
     try {
       const result = await client.verifyLogin(state.login, state.code);
       const session = { accessToken: result.accessToken, userId: result.userId, login: result.login };
-      // The login flow proves MAX identity; the second read checks whether this
-      // identity has one of the staff roles allowed to use the management UI.
+      // Код подтверждает владение MAX-аккаунтом, но доступ в панель зависит от
+      // роли. Поэтому после выдачи JWT отдельно читаем пользователя и пропускаем
+      // только сотрудников с управленческими правами.
       const user = await api(session).currentUser(result.userId);
 
       if (!isStaffRole(user.role)) {

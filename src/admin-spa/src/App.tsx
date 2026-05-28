@@ -46,8 +46,8 @@ export function App() {
     setLoading(true);
     setNotice(undefined);
     try {
-      // The user record is loaded with the reference data because role and
-      // university scope define which management actions the UI may expose.
+      // Пользователь, вузы и мероприятия загружаются вместе: роль и вуз сотрудника
+      // определяют, какие действия можно показывать в интерфейсе управления.
       const [nextUser, nextUniversities, nextEvents] = await Promise.all([
         client.currentUser(session.userId),
         client.universities(),
@@ -73,8 +73,9 @@ export function App() {
 
   async function refreshEventDetails(eventId: string) {
     try {
-      // Participants and registrars are kept separate from the event list so
-      // switching cards stays cheap and the detail pane can be refreshed alone.
+      // Участники и регистраторы загружаются отдельно от списка мероприятий. Так
+      // можно обновлять правую панель после отметки посещения или назначения
+      // регистратора, не перезагружая весь экран.
       const [nextRegistrations, nextRegistrars] = await Promise.all([client.registrations(eventId), client.registrars(eventId)]);
       setRegistrations(nextRegistrations);
       setRegistrars(nextRegistrars);

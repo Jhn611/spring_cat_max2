@@ -145,8 +145,10 @@ app.post<{ Body: { login: string; code: string } }>('/auth/login/verify', async 
   };
 });
 
-// Gateway держит внешний контракт единым: клиенты не знают внутренние адреса
-// data-service и task-service. Перед проксированием запрос обязан пройти JWT.
+// Gateway оставляет внешним клиентам один HTTP-контракт: бот, SPA и будущие
+// интеграции не знают внутренние адреса data-service и task-service. Перед
+// проксированием запрос проходит JWT-проверку, а web-клиенты дополнительно
+// ограничиваются своей ролью и вузом.
 app.route({
   method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'],
   url: '/tasks/*',
@@ -206,7 +208,9 @@ async function authenticate(request: FastifyRequest, reply: FastifyReply): Promi
       return { ...payload, client: 'bot' };
     }
   } catch {
-    // If bot auth fails, try client auth below. A final 401 is sent only once.
+    // Один gateway принимает асимметричный токен бота и симметричный токен
+    // web-клиента. Сначала пробуем bot JWT, затем client JWT; итоговый 401
+    // отправляется только после обеих неудачных проверок.
   }
 
   try {

@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { Button, Input, Panel } from '@maxhub/max-ui';
 import type { Registration } from '../../types';
 
+// Панель участников нужна регистратору и организатору на месте события: здесь
+// виден список записей, поиск по коду и отметка фактического посещения.
 type ParticipantsPanelProps = {
   registrations: Registration[];
   onMarkAttended: (registration: Registration) => Promise<void>;

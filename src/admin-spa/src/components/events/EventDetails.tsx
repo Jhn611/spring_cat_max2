@@ -2,6 +2,8 @@ import { Button, Panel } from '@maxhub/max-ui';
 import type { EventCard, University } from '../../types';
 import { formatDateTime, universityName } from '../../utils';
 
+// Детальная карточка показывает состояние выбранного мероприятия и оставляет
+// рядом только действия над самим событием: редактирование, удаление и восстановление.
 type EventDetailsProps = {
   event: EventCard;
   universities: University[];

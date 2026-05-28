@@ -60,8 +60,9 @@ const ui = {
   admin: '🛠️'
 } as const;
 
-// In-memory сценарии нужны для пошаговых действий в MAX: создание и изменение
-// мероприятия занимают несколько сообщений, поэтому бот помнит, какой ответ ждёт.
+// Пошаговые сценарии в MAX держатся в памяти процесса: создание, изменение и
+// администрирование мероприятий занимают несколько сообщений, поэтому бот помнит,
+// какой ответ ждёт от конкретного пользователя прямо сейчас.
 type EventDraft = Partial<CreateEventInput> & {
   date?: string;
   time?: string;
@@ -233,7 +234,8 @@ async function deleteTrackedScreen(ctx: AnyContext, keepIds: string[] = []): Pro
     try {
       await ctx.api.deleteMessage(id);
     } catch {
-      // The message may already be gone or unavailable for deletion.
+      // Сообщение могло быть уже удалено, отредактировано или недоступно боту.
+      // Для пользователя это не критично: продолжаем сценарий без лишней ошибки.
     }
   }
 
@@ -265,7 +267,8 @@ async function renderSingle(ctx: AnyContext, text: string, extra?: ReplyExtra): 
       rememberScreen(ctx, [currentId]);
       return;
     } catch {
-      // Some callback messages cannot be edited; fall back to a fresh screen.
+      // MAX может запретить редактирование старого или чужого callback-сообщения.
+      // В таком случае создаём новый экран и всё равно доводим сценарий до конца.
     }
   }
 
@@ -3370,7 +3373,8 @@ async function answerCallback(ctx: AnyContext) {
   try {
     await ctx.answerOnCallback({ notification: null });
   } catch {
-    // Callback may already be answered by the platform; user-facing reply is more important.
+    // Callback мог быть уже подтверждён платформой. Пользовательский ответ важнее,
+    // поэтому не прерываем обработчик из-за технической ошибки подтверждения.
   }
 }
 

@@ -13,6 +13,8 @@ import type {
 } from '../shared/types.js';
 import { signBotJwt } from '../shared/auth.js';
 
+// Клиент бота знает только публичный API gateway. Перед каждым запросом он
+// выпускает короткоживущий JWT, а внутренние адреса сервисов остаются скрытыми.
 export class ApiClient {
   constructor(private readonly baseUrl: string) {}
 

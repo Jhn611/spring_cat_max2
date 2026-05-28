@@ -5,6 +5,8 @@ import { roleLabels } from '../../constants';
 import type { Role, StoredUser, University } from '../../types';
 import { positiveNumber } from '../../utils';
 
+// Экран управления ролями собран отдельно от мероприятий, чтобы правила доступа
+// техадмина и вузовского админа были видны в одном месте и не смешивались с UI событий.
 type AdminWorkspaceProps = {
   user?: StoredUser;
   universities: University[];

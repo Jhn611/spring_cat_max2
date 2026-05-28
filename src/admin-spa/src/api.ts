@@ -96,8 +96,8 @@ export class ApiClient {
     return this.request(`/users/${userId}/role`, { method: 'PATCH', body: { role, universityId } });
   }
 
-  // Browser clients talk only to the public gateway. The gateway validates JWT
-  // and enforces role/university scope before proxying to internal services.
+  // Браузерная панель обращается только к публичному gateway. Он проверяет JWT,
+  // ограничивает запрос ролью и вузом, а затем проксирует его во внутренний сервис.
   private async request<T>(path: string, options: { method?: string; body?: unknown; anonymous?: boolean; empty?: boolean } = {}): Promise<T> {
     const headers = new Headers();
     if (options.body !== undefined) headers.set('content-type', 'application/json');

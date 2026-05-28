@@ -6,6 +6,9 @@ import { EventList } from './EventList';
 import { ParticipantsPanel } from './ParticipantsPanel';
 import { RegistrarsPanel } from './RegistrarsPanel';
 
+// Рабочая область мероприятий склеивает список, форму, детали, участников и
+// регистраторов. Бизнес-действия приходят через props, поэтому компонент остаётся
+// представлением и не знает деталей HTTP-запросов.
 type EventsWorkspaceProps = {
   user?: StoredUser;
   universities: University[];

@@ -3,6 +3,8 @@ import { Button, Input, Panel } from '@maxhub/max-ui';
 import type { EventRegistrar } from '../../types';
 import { positiveNumber } from '../../utils';
 
+// Регистраторы привязаны не просто к вузу, а к конкретному мероприятию. Поэтому
+// панель принимает eventId и отдаёт наружу точечные команды назначения и снятия.
 type RegistrarsPanelProps = {
   eventId: string;
   registrars: EventRegistrar[];

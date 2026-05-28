@@ -1,3 +1,5 @@
+// Shared-типы описывают общий контракт между ботом, gateway, data-service,
+// task-service и SPA. Изменения публичных сущностей лучше начинать с этого файла.
 export type Role = 'applicant' | 'organizer' | 'admin' | 'tech_admin';
 
 export type EventFormat = 'online' | 'offline';

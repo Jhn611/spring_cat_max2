@@ -24,6 +24,8 @@ import type {
 
 const { Pool } = pg;
 
+// DatabaseStore инкапсулирует всю работу с PostgreSQL через Drizzle: маршруты
+// data-service вызывают методы хранилища и не зависят от таблиц, индексов и миграций.
 type DbUserRow = typeof schema.users.$inferSelect;
 type DbRegistrationRow = typeof schema.registrations.$inferSelect;
 type DbEventRow = typeof schema.events.$inferSelect;

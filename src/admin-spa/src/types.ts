@@ -1,3 +1,5 @@
+// Типы SPA повторяют публичный контракт gateway и data-service. Это помогает
+// компонентам работать с предсказуемыми структурами без знания серверной схемы БД.
 export type Role = 'applicant' | 'organizer' | 'admin' | 'tech_admin';
 export type EventFormat = 'online' | 'offline';
 export type RegistrationStatus = 'confirmed' | 'attended' | 'cancelled_by_user' | 'cancelled_by_organizer' | 'late_cancelled';

@@ -2,6 +2,8 @@ import type { EventCard, EventFormState, EventInput, EventSlot, Session, StoredU
 import { SESSION_KEY } from './constants';
 import type { api } from './api';
 
+// Утилиты SPA держат преобразования данных рядом с интерфейсом: хранение сессии,
+// сборку payload для API и форматирование значений, которые видит сотрудник.
 export function emptyEventForm(universityId = ''): EventFormState {
   return {
     universityId,

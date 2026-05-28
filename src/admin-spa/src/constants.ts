@@ -1,5 +1,7 @@
 import type { Role } from './types';
 
+// Константы фронтенда отделены от компонентов, чтобы подписи ролей и правила
+// допуска в панель были едиными для экрана входа, навигации и админского раздела.
 export const SESSION_KEY = 'springcat.admin.session';
 
 export const roleLabels: Record<Role, string> = {

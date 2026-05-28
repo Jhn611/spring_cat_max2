@@ -34,8 +34,9 @@ function businessLog(event: string, fields: Record<string, unknown>): Record<str
 const worker = new Worker<NotificationJobInput>(
   'notifications',
   async (job) => {
-    // Уведомления отправляются вне обработчика бота: массовая рассылка не блокирует
-    // диалог пользователя, а BullMQ сам повторит задачу при временных сбоях.
+    // Уведомления выполняются в отдельном worker-процессе: массовая рассылка не
+    // блокирует ответы бота и gateway. BullMQ хранит задачу в Redis, поэтому
+    // временный сбой MAX API можно обработать повторной попыткой.
     if (!bot) {
       throw new Error('MAX_BOT_TOKEN is required for notification jobs');
     }

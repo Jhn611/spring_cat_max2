@@ -1,5 +1,7 @@
 import { bigint, boolean, index, integer, jsonb, pgTable, primaryKey, text, timestamp } from 'drizzle-orm/pg-core';
 
+// Drizzle-схема является источником правды для структуры PostgreSQL. Миграции
+// строятся вокруг этих таблиц, а DatabaseStore использует их вместо ручного SQL.
 export const universities = pgTable('universities', {
   id: text('id').primaryKey(),
   title: text('title').notNull(),
