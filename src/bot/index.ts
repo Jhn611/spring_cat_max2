@@ -1412,7 +1412,9 @@ function createDateKeyboard(mode: 'create' | 'edit', monthRaw?: string): ReplyEx
 
       const date = new Date(Date.UTC(year, month - 1, day));
       const compact = compactDate(date);
-      week.push(button(String(day).padStart(2, '0'), compact < todayCompact ? 'flow:noop' : `${callbackPrefix(mode, 'date')}:${compact}`));
+      const isPastDate = compact < todayCompact;
+      const label = isPastDate ? '-' : String(day).padStart(2, '0');
+      week.push(button(label, isPastDate ? 'flow:noop' : `${callbackPrefix(mode, 'date')}:${compact}`));
     }
 
     dateRows.push(week);
@@ -2067,7 +2069,7 @@ async function showCreateDateMonth(ctx: AnyContext, monthRaw: string): Promise<v
     return;
   }
 
-  await sendNewMessage(ctx, createEventPrompt('date'), createDateKeyboard('create', monthRaw));
+  await renderSingle(ctx, createEventPrompt('date'), createDateKeyboard('create', monthRaw));
 }
 
 async function showCreateSlotHourPicker(ctx: AnyContext, rawValue: string): Promise<void> {
@@ -2187,7 +2189,7 @@ async function showEditDateMonth(ctx: AnyContext, monthRaw: string): Promise<voi
     return;
   }
 
-  await sendNewMessage(ctx, editValuePrompt('date'), createDateKeyboard('edit', monthRaw));
+  await renderSingle(ctx, editValuePrompt('date'), createDateKeyboard('edit', monthRaw));
 }
 
 async function showEditMinutePicker(ctx: AnyContext, hour: string): Promise<void> {
