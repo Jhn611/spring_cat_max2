@@ -1,6 +1,7 @@
 import type { EventCard, EventInput, EventRegistrar, Registration, Role, Session, StoredUser, University } from './types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3050';
+const normalizedApiBaseUrl = API_BASE_URL.endsWith('/') ? API_BASE_URL : `${API_BASE_URL}/`;
 
 type LoginStartResponse =
   | { login: string; linked: true; delivery: 'bot_message'; expiresAt: string }
@@ -103,7 +104,7 @@ export class ApiClient {
     if (options.body !== undefined) headers.set('content-type', 'application/json');
     if (!options.anonymous && this.session) headers.set('authorization', `Bearer ${this.session.accessToken}`);
 
-    const response = await fetch(new URL(path, API_BASE_URL), {
+    const response = await fetch(apiUrl(path), {
       method: options.method ?? 'GET',
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body)
@@ -124,4 +125,8 @@ export class ApiClient {
 
 export function api(session?: Session): ApiClient {
   return new ApiClient(session);
+}
+
+function apiUrl(path: string): URL {
+  return new URL(path.replace(/^\/+/, ''), normalizedApiBaseUrl);
 }
