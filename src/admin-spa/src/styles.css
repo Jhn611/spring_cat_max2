@@ -70,7 +70,7 @@ select {
 .form-grid label:focus-within,
 .panel-block > label:focus-within,
 .slot-builder label:focus-within {
-  color: #0b69b7;
+  color: #cecece;
 }
 
 .field-label input,
