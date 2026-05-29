@@ -53,7 +53,6 @@ select {
 .field-label{
   height: 80px;
 }
-
 .field-label,
 .form-grid label,
 .panel-block > label,
@@ -65,7 +64,9 @@ select {
   color: #33475b;
   transition: color 160ms ease;
 }
-
+.form-grid{
+  color: #dbdbdb;
+}
 .field-label:focus-within,
 .form-grid label:focus-within,
 .panel-block > label:focus-within,
